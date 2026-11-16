@@ -15548,6 +15548,10 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         };
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
+        // STRATA_PIPE_SLIDE=1 (opt-in, research): the admission's wait for the adaptive tier is slid into the
+        // previous round's window gap rather than paid at BGEN. Only the batch path takes it; unset, every
+        // admission drains exactly as before.
+        static const bool pipe_slide = [] { const char* v = std::getenv("STRATA_PIPE_SLIDE"); return v != nullptr && std::atoi(v) != 0; }();
         long long admit_max_new = 0;
         // BCO <slot> <ids> (research, PAR-H; STRATA_COALESCE_PREFILL on the server): prompts of waiting requests, read in
         // the SAME layer-major pass as the next BGEN's prompt into the named idle slots' sessions (the experts a layer
@@ -16695,11 +16699,17 @@ int main(int argc, char** argv) {
                 continue;
             }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
-            // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
-            if (!adapt_tick(true)) {
+            // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first.
+            // STRATA_PIPE_SLIDE=1 (--batch >= 2): the tier is slid into the previous round's gap — when the job is
+            // already idle and its copies are done, the admission pays no drain. A tier still in flight, or a
+            // single-stream run, keeps the upstream drain untouched.
+            const bool slid = pipe_slide && o.batch >= 2 && ajob && a_ready(false);
+            if (!slid && !adapt_tick(true)) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
             }
+            if (trace && slid)
+                std::fprintf(stderr, "strata batch: admission drain slid (the tier was already idle, copies done)\n");
             admit_slot = -1;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
