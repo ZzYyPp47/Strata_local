@@ -240,4 +240,10 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
 
+// STRATA_SESSION_JOURNAL=1: one append-only journal of the disk sessions, beside the session file.  Appends `line`
+// (one record, terminated by '\n') to "<folder of path>/.strata-session-journal", created when absent (mode 0600 on
+// POSIX).  A hidden name, so the server never accepts it as a session name.  Returns false with `error` when the file
+// could not be opened or written; a journal failure never fails the save or the restore it records.
+bool session_journal_append(const std::string& path, const std::string& line, std::string& error);
+
 } // namespace strata::core

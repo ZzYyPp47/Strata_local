@@ -927,6 +927,52 @@ std::string session_free_space_dir(const std::string& path, bool windows_rules) 
     return p.substr(0, cut + 1);   // with its trailing backslash: "\\server\share\dir\", "C:\"
 }
 
+bool session_journal_append(const std::string& path, const std::string& line, std::string& error) {
+    // the journal sits beside the session file, under a hidden name the server rejects as a session name
+    std::string dir, leaf;
+    if (!split_path(path, dir, leaf, error)) return false;
+    const std::string sep =
+#ifdef _WIN32
+        "\\";
+#else
+        "/";
+#endif
+    const std::string journal = (dir.empty() ? std::string() : dir + sep) + ".strata-session-journal";
+    const std::string record = line + "\n";
+#ifdef _WIN32
+    std::wstring w;
+    if (!wide(journal, w)) { error = "the journal path is not valid UTF-8"; return false; }
+    HANDLE h = CreateFileW(w.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { const DWORD c = GetLastError(); error = last_error(c); return false; }
+    // OPEN_ALWAYS keeps the existing bytes; append by moving to the end before the write (the share modes above
+    // let a second writer do the same, so records of two engines interleave whole lines, not partial ones)
+    LARGE_INTEGER end{};
+    if (!GetFileSizeEx(h, &end) || !SetFilePointerEx(h, end, nullptr, FILE_BEGIN)) {
+        const DWORD c = GetLastError(); error = last_error(c); CloseHandle(h); return false;
+    }
+    DWORD n = 0;
+    const bool ok = WriteFile(h, record.data(), (DWORD) record.size(), &n, nullptr) && n == record.size();
+    if (!ok) { const DWORD c = GetLastError(); error = last_error(c); }
+    FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok;
+#else
+    const int fd = ::open(journal.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if (fd < 0) { error = std::strerror(errno); return false; }
+    size_t left = record.size();
+    const uint8_t* p = (const uint8_t*) record.data();
+    while (left) {
+        const ssize_t w = ::write(fd, p, left);
+        if (w <= 0) { const int e = errno; error = std::strerror(e); ::close(fd); return false; }
+        p += (size_t) w; left -= (size_t) w;
+    }
+    ::fsync(fd);
+    ::close(fd);
+    return true;
+#endif
+}
+
 std::vector<SessionModelFile> session_model_inputs(const SessionInputs& in) {
     std::vector<SessionModelFile> f;
     for (size_t i = 0; i < in.native_shards.size(); ++i) f.push_back({"native shard " + std::to_string(i), in.native_shards[i]});

@@ -485,6 +485,12 @@ bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapsho
     static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
+// STRATA_SESSION_JOURNAL=1: record every disk session (SAVE / RESTORE, and a save that published a new file and then
+// failed) in a journal beside the session file.  Unset = nothing extra is written; the default path stays as it was.
+bool session_journal_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SESSION_JOURNAL"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 // STRATA_CKPT_POOL: unset = the engine's default (on in a single-stage serve with a conversation cache: park_pool_plan), 0 = off, any
 // other value = on.  -1 unset, 0 off, 1 on (read once)
 int ckpt_pool_env_state() {
@@ -16814,6 +16820,26 @@ int main(int argc, char** argv) {
                 const std::string path = line.substr(save ? 5 : 8);
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+                // STRATA_SESSION_JOURNAL=1: one JSON record per disk session, appended to a journal beside the session
+                // file.  A journal failure is a warning on stderr: it never refuses, changes or reorders the save.
+                auto jtext = [](const std::string& s) {
+                    std::string out;
+                    for (const char c : s) {
+                        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+                        else if (c == '\n' || c == '\r') out += ' ';
+                        else if ((uint8_t) c < 0x20) out += '?';
+                        else out += c;
+                    }
+                    return out;
+                };
+                auto journal = [&](const std::string& record) {
+                    if (!session_journal_env()) return;
+                    std::string jerr;
+                    if (!strata::core::session_journal_append(path, record, jerr))
+                        std::fprintf(stderr, "strata serve: session journal: %s\n", jerr.c_str());
+                };
+                const auto jnow = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
                                   bool published = false) {
                     std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : "restore", path.c_str(),
@@ -16822,6 +16848,10 @@ int main(int argc, char** argv) {
                     for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
                     std::printf("SERR %s %d %s\n", strata::core::session_error_name(kind), published ? 1 : 0, one.c_str());
                     std::fflush(stdout);
+                    if (published) {   // the old file is gone and the new one is published: worth a journal line
+                        journal("{\"action\":\"save-published\",\"path\":\"" + jtext(path) + "\",\"reason\":\"" +
+                                jtext(one) + "\",\"ts\":" + std::to_string(jnow) + "}");
+                    }
                     err.clear();
                 };
                 auto moving = [&](uint64_t done, uint64_t total) {
@@ -16955,6 +16985,10 @@ int main(int argc, char** argv) {
                                  "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
                                  path.c_str(), ms(), capture_ms);
                     std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    journal("{\"action\":\"save\",\"path\":\"" + jtext(path) + "\",\"tokens\":" + std::to_string(live.size()) +
+                            ",\"kept_checkpoints\":" + std::to_string(kept) + ",\"bytes\":" + std::to_string(bytes) +
+                            ",\"ms\":" + std::to_string(ms()) + ",\"state_ms\":" + std::to_string(capture_ms) +
+                            ",\"ts\":" + std::to_string(jnow) + "}");
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
@@ -17034,6 +17068,10 @@ int main(int argc, char** argv) {
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
                                  ms(), read_ms);
                     std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    journal("{\"action\":\"restore\",\"path\":\"" + jtext(path) + "\",\"tokens\":" + std::to_string(live.size()) +
+                            ",\"checkpoints\":" + std::to_string(checks.size()) + ",\"bytes\":" + std::to_string(bytes) +
+                            ",\"ms\":" + std::to_string(ms()) + ",\"read_ms\":" + std::to_string(read_ms) +
+                            ",\"ts\":" + std::to_string(jnow) + "}");
                 }
                 std::fflush(stdout);
                 continue;
