@@ -8823,7 +8823,7 @@ int main(int argc, char** argv) {
                                  "(layer, expert) pair lifts it - tools/make_profile.py)\n", o.expert_cache,
                          profile.size(), o.expert_profile.c_str(), profile.size());
         o.expert_cache = (int) sized_slots.size();
-#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL) && !defined(_WIN32)
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
         // ---- AUTO NO-BORROW (0.2.10).  With batch slots on one NVIDIA card the prompt path lent cache slots to its own
         // buffers, and every lent slot's expert was read again from the host during each chunk.  When the card holds EVERY
         // expert of the profile and still has room for the path's own buffers (the chunk the loan would have used, 8192)
@@ -8831,11 +8831,18 @@ int main(int argc, char** argv) {
         // the arithmetic is the same (QUAL-PAR2: 12/12 identical, KL 0).  A card that cannot hold all experts keeps the loan -
         // its cache is worth more than the buffers (a 16 GB A4000 lost 2.5x on a long prompt and ran out of memory with them).
         // Not with an explicit --prefill N, a split, helper caches, STRATA_PREFILL_BORROW=1 or STRATA_AUTO_NOBORROW=0.
+        // Local slice C1 (2026-11-17): Windows is compiled now but armed ONLY by an explicit STRATA_AUTO_NOBORROW=1;
+        // unset, Windows keeps today's loan byte for byte (the rule was excluded from Windows builds before this slice).
         if (auto_cache && pf_borrow && o.prefill_auto && o.batch >= 2 && !multi_gpu && stages.empty() && !profile.empty() &&
             sized_slots.size() == profile.size() && std::none_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(), [](int n) { return n > 0; })) {
             const char* e1 = std::getenv("STRATA_AUTO_NOBORROW");
             const char* e2 = std::getenv("STRATA_PREFILL_BORROW");
-            if (!(e1 != nullptr && e1[0] == '0') && !(e2 != nullptr && e2[0] == '1')) {
+#ifdef _WIN32
+            const bool armed = e1 != nullptr && e1[0] == '1';
+#else
+            const bool armed = !(e1 != nullptr && e1[0] == '0');
+#endif
+            if (armed && !(e2 != nullptr && e2[0] == '1')) {
                 constexpr int64_t kNoBorrowChunk = 8192, kNoBorrowKeepMib = 3072;
                 uint64_t used_b = 0;
                 for (const int64_t sb : sized_slots) used_b += (uint64_t) strata::core::ExpertCache::slot_stride(sb, slot_guard);
@@ -12494,7 +12501,11 @@ int main(int argc, char** argv) {
                     gs.ver.set_remote_expert_opt(remote_opt.get());
                     // --batch-mtp: every stage runs the same 2-rows-per-slot windows as the first (up to kVerifyMaxT
                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
-                    if (batch_mtp) gs.ver.set_batch_graph_limit(64);
+                    // Local slice C4 (2026-11-17): STRATA_BATCH_GRAPH_LIMIT=N overrides the bound on any batch (LRU in
+                    // verify.cpp); unset, --batch-mtp keeps its 64 and every other batch keeps all layouts as 0.1.39.
+                    const char* gl_s = std::getenv("STRATA_BATCH_GRAPH_LIMIT");
+                    if (gl_s != nullptr && std::atoi(gl_s) > 0) gs.ver.set_batch_graph_limit((size_t) std::atoi(gl_s));
+                    else if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     // (STRATA_PIPED_MTP: a group's window is its one slot's token and proposals, at most --spec rows,
                     // so the stage keeps the windows it has without --batch-mtp - the solo path's too)
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, batch_max_t(), err);
@@ -12575,7 +12586,11 @@ int main(int argc, char** argv) {
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
-        if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        // Local slice C4 (2026-11-17): STRATA_BATCH_GRAPH_LIMIT=N bounds captured batch layouts on any batch
+        // (LRU-evict beyond N, verify.cpp batch_graph_limit_); unset keeps 0.1.39 (--batch-mtp its own 64).
+        const char* gl_m = std::getenv("STRATA_BATCH_GRAPH_LIMIT");
+        if (gl_m != nullptr && std::atoi(gl_m) > 0) ver.set_batch_graph_limit((size_t) std::atoi(gl_m));
+        else if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2) ver.set_taps(df2.tap_layers());
         if (batch_df2) ver.set_batch_taps(true);
