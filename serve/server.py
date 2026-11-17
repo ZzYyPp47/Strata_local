@@ -4921,7 +4921,8 @@ class Service:
         self.api_monitor = False
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
-        self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
+        self.history = collections.deque(maxlen=1000)   # the last finished requests, newest last (GET /metrics);
+                                                        # 2026-11-17: 500 -> 1000, the Monitor's window
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
