@@ -5,6 +5,7 @@
 // the arithmetic non-trivial, so the geometry here has cells != tokens.
 
 #include "strata/core/conversation_delta.hpp"
+#include "strata/core/conversation_disk_cache.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -323,6 +324,104 @@ int main() {
         uint64_t valid = 0;
         std::string bad;
         check(!session_delta_read(delta_path, other, n0, base_file, segs, valid, bad), "another model is refused");
+    }
+
+    // ---- the idle flush (--conversation-cache-disk-flush-sec): a parked conversation reaches the disk from its own
+    // buffers, and what the disk then holds merges to exactly a full write of the grown conversation
+    {
+        const fs::path dir2 = dir / "idle";
+        fs::create_directories(dir2, mk);
+        ConversationDiskCache disk(dir2.string(), (uint64_t) 1 << 30, 2048, 0);
+        disk.set_identity([](SessionFileIdentity& out, std::string&) {
+            out = SessionFileIdentity{0x1111222233334444ull, 0x5555666677778888ull};
+            return true;
+        });
+        ConversationCache ram((size_t) 1 << 30, 4, 2048);
+        disk.attach(&ram);
+        disk.enable_delta(1, 0, 0);   // the flush's own thresholds; the fold off
+        check(disk.ready(), "the disk tier is wired to a RAM cache");
+
+        // the base, the way an eviction hands an image over
+        SavedConversation evicted = base;
+        disk.enqueue(std::move(evicted));
+        disk.flush(std::vector<SavedConversation>{}, 30);
+        check(disk.stats().writes == 1, "the eviction wrote the base");
+
+        SavedConversation grown = image_at(n2, 1);
+        check(ram.put(std::move(grown)), "the grown conversation is parked");
+        uint64_t wrote = 0;
+        const size_t seen = ram.flush_visit(3, [&](const SavedConversation& img) {
+            // the shipped builder reads the same five parts of the parked buffers (conversation_kv_image_sources,
+            // which lives in conversation_snapshot.cpp with the kernels); sources_of is the same read here
+            std::vector<SessionKvSource> src = sources_of(img, error);
+            wrote += disk.flush_image(img, 256, std::move(src));
+        });
+        check(seen == 1, "the idle pass visited the parked conversation");
+        check(wrote > 0, "the idle pass wrote its growth");
+        check(disk.stats().delta_writes == 1 && disk.stats().flushes == 1, "one segment, counted as an idle flush");
+        uint64_t again1 = 0;
+        const size_t seen2 = ram.flush_visit(3, [&](const SavedConversation& img) {
+            std::vector<SessionKvSource> src = sources_of(img, error);
+            again1 += disk.flush_image(img, 256, std::move(src));
+        });
+        check(seen2 == 1 && again1 == 0 && disk.stats().flushes == 1, "a second pass has nothing new to write");
+
+        // what the disk now holds, read back as a reader would: base + chain == a full write at n2
+        fs::path written;
+        for (const auto& e : fs::directory_iterator(dir2))
+            if (e.path().extension() == ".conv") written = e.path();
+        check(!written.empty(), "the base file is where the disk tier keeps it");
+        SavedConversation merged;
+        size_t read = 0;
+        bool used = false;
+        check(session_delta_apply(written.string(), session_delta_path(written.string()), id, merged, read, error,
+                                  used) && used,
+              "the idle flush's chain applies over the base");
+        SavedConversation reference;
+        check(full_round_trip(dir / "full-idle.conv", image_at(n2, 1), id, reference, error), "reference write at n2");
+        check(same_image(merged, reference), "the idle flush leaves exactly a full image at n2");
+        disk.close();
+    }
+
+    // ---- a parked conversation the disk has never seen: the idle pass writes the whole image (the one a hard kill
+    // would lose), and the pass after it has nothing to do
+    {
+        const fs::path dir3 = dir / "idle-new";
+        fs::create_directories(dir3, mk);
+        ConversationDiskCache disk(dir3.string(), (uint64_t) 1 << 30, 2048, 0);
+        disk.set_identity([](SessionFileIdentity& out, std::string&) {
+            out = SessionFileIdentity{0x1111222233334444ull, 0x5555666677778888ull};
+            return true;
+        });
+        ConversationCache ram((size_t) 1 << 30, 4, 2048);
+        disk.attach(&ram);
+        disk.enable_delta(1, 0, 0);
+
+        SavedConversation fresh = image_at(n0, 7);
+        for (auto& t : fresh.live.ids) t += 500000;   // another conversation, so another file
+        check(ram.put(std::move(fresh)), "the unseen conversation is parked");
+        uint64_t wrote = 0;
+        ram.flush_visit(3, [&](const SavedConversation& img) {
+            std::vector<SessionKvSource> src = sources_of(img, error);
+            wrote += disk.flush_image(img, 256, std::move(src));
+        });
+        check(wrote > 0, "the whole image went to the disk");
+        check(disk.stats().writes == 1 && disk.stats().flushes == 1, "counted as a write and as an idle flush");
+        uint64_t again = 0;
+        ram.flush_visit(3, [&](const SavedConversation& img) {
+            std::vector<SessionKvSource> src = sources_of(img, error);
+            again += disk.flush_image(img, 256, std::move(src));
+        });
+        check(again == 0 && disk.stats().writes == 1, "the pass after it writes nothing");
+
+        // and a request for it finds it on the disk again (the recall path a restart uses).  recall() matches a
+        // PROMPT that continues the parked conversation, so probe with one more token, as the next request does.
+        const SavedConversation& parked = *ram.find(1);
+        std::vector<int32_t> probe = parked.live.ids;
+        probe.push_back(777777);
+        check(disk.recall(probe, parked.live.imgs, parked.cvec), "recall reads the idle write back");
+        check(ram.size() == 2, "the recalled image is parked beside the one it came from");
+        disk.close();
     }
 
     std::printf("conversation_delta_test: %d checks passed\n", checks);

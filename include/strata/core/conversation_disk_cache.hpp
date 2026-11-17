@@ -64,6 +64,10 @@ struct ConvDiskStats {
     uint64_t delta_writes = 0, delta_bytes = 0, delta_errors = 0, compactions = 0, delta_reads = 0;
     double last_delta_ms = 0;
     uint64_t last_delta_read_bytes = 0;
+    // the idle flusher (--conversation-cache-disk-flush-sec): images written while the engine sat quiet
+    uint64_t flushes = 0, flush_bytes = 0;
+    uint64_t last_flush_bytes = 0;
+    double last_flush_ms = 0;
 };
 
 // Where one conversation's increment stands: the base file it extends and the newest point on its chain.
@@ -132,7 +136,8 @@ public:
     // Should this conversation's increment be written now?  `out` is the chain the new segment extends.
     template <class Token>
     bool delta_due(const std::vector<Token>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec,
-                   int64_t live_tokens, ConvDiskDeltaInfo& out);
+                   int64_t live_tokens, ConvDiskDeltaInfo& out, int64_t min_growth = -1,
+                   bool respect_time = true, bool check_queue = true);
 
     void delta_submit(DeltaJob&& job);
 
@@ -274,7 +279,7 @@ public:
         std::snprintf(b, sizeof b,
                       "disk: %llu files %.1f GiB / %.1f GiB cap, hits %llu miss %llu writes %llu (last %.0f ms) "
                       "errors %llu dropped %llu quota-deleted %llu, delta %llu segments %.2f GiB (+%.0f ms last, "
-                      "read %llu) compactions %llu errors %llu",
+                      "read %llu) compactions %llu errors %llu, idle-flush %llu %.2f GiB (last %.2f GiB %.0f ms)",
                       (unsigned long long) stats_.files, (double) stats_.bytes / 1073741824.0,
                       cap_bytes_ == 0 ? 0.0 : (double) cap_bytes_ / 1073741824.0, (unsigned long long) stats_.hits,
                       (unsigned long long) stats_.misses, (unsigned long long) stats_.writes, stats_.last_write_ms,
@@ -282,7 +287,9 @@ public:
                       (unsigned long long) stats_.quota_deletes, (unsigned long long) stats_.delta_writes,
                       (double) stats_.delta_bytes / 1073741824.0, stats_.last_delta_ms,
                       (unsigned long long) stats_.delta_reads, (unsigned long long) stats_.compactions,
-                      (unsigned long long) stats_.delta_errors);
+                      (unsigned long long) stats_.delta_errors, (unsigned long long) stats_.flushes,
+                      (double) stats_.flush_bytes / 1073741824.0, (double) stats_.last_flush_bytes / 1073741824.0,
+                      stats_.last_flush_ms);
         return std::string(b);
     }
 
@@ -340,9 +347,20 @@ private:
     void sweep();
     void enforce_quota();
     void write_loop();
-    bool write_one(SavedConversation& image);
+    bool write_one(const SavedConversation& image, uint64_t* written = nullptr);
     void delta_loop();
     bool delta_write_one(DeltaJob& job);
+
+public:
+    // The idle flusher's write (generate.cpp's conv_flusher): the conversation a park left in the RAM cache, written
+    // straight out of its own host buffers.  Appends the part the chain does not cover when a base exists and the
+    // growth passes `min_growth`; writes the whole image when the disk holds no base for this conversation at all.
+    // Returns the bytes written (0: nothing to do, the chain is current, or the write was refused).  The caller holds
+    // the engine's conversation scope, so no park or eviction can move these buffers under the write.
+    uint64_t flush_image(const SavedConversation& image, int64_t min_growth,
+                         std::vector<SessionKvSource>&& sources);
+
+private:
     static int64_t now_ms() {
         return (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now().time_since_epoch())
@@ -597,7 +615,122 @@ inline void ConversationDiskCache::write_loop() {
     }
 }
 
-inline bool ConversationDiskCache::write_one(SavedConversation& image) {
+inline uint64_t ConversationDiskCache::flush_image(const SavedConversation& image, int64_t min_growth,
+                                                   std::vector<SessionKvSource>&& sources) {
+    static const bool fl_trace = std::getenv("STRATA_DELTA_TRACE") != nullptr;
+    if (!ready()) {
+        if (fl_trace) std::fprintf(stderr, "strata flush image: disk tier not ready\n");
+        return 0;
+    }
+    const int64_t tokens = (int64_t) image.live.ids.size();
+    // (2026-11-18) No second min-tokens gate here: flush_visit already applied `wants()` to this entry, and the
+    // flusher's own growth gate decides the rest.  A duplicate gate silently dropped every conversation between
+    // the two thresholds.
+    if (tokens <= 0) return 0;
+    SessionFileIdentity id;
+    std::string err;
+    if (!identity_(id, err)) {
+        if (fl_trace) std::fprintf(stderr, "strata flush image: identity unavailable: %s\n", err.c_str());
+        return 0;
+    }
+    // Claim the increment writer for the whole pass: it is what delta_join() waits on and what a turn-end coalesces on,
+    // and it keeps two writers off one chain.  Released on every way out.
+    struct Claim {
+        ConversationDiskCache* self;
+        bool taken = false;
+        explicit Claim(ConversationDiskCache* c) : self(c) {
+            std::lock_guard<std::mutex> lk(self->mu_);
+            if (self->delta_writing_ || !self->delta_queue_.empty()) return;
+            self->delta_writing_ = true;
+            taken = true;
+        }
+        ~Claim() {
+            if (!taken) return;
+            {
+                std::lock_guard<std::mutex> lk(self->mu_);
+                self->delta_writing_ = false;
+            }
+            self->cv_delta_done_.notify_all();
+        }
+    } claim{this};
+    if (!claim.taken) {
+        if (fl_trace) std::fprintf(stderr, "strata flush image: a delta writer is busy\n");
+        return 0;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t bytes = 0;
+    ConvDiskDeltaInfo info;
+    if (!sources.empty() && delta_ &&
+        delta_due(image.live.ids, image.live.imgs, image.cvec, tokens, info, min_growth, false, false)) {
+        // Only the part the base does not cover goes, read straight out of the parked buffers: the live state and the
+        // deepest checkpoint are what the segment needs besides them (a copy of those, not of the K/V).
+        SavedConversation meta;
+        meta.geometry = image.geometry;
+        meta.layer_lo = image.layer_lo;
+        meta.layer_hi = image.layer_hi;
+        meta.cvec = image.cvec;
+        meta.live = image.live;
+        meta.checkpoints = session_checkpoints_to_save(image.checkpoints);
+        DeltaJob job;
+        job.key = info.key;
+        job.path = info.path;
+        job.base_tokens = info.base_tokens;
+        job.prev_live = info.prev_live;
+        job.base_bytes = info.base_bytes;
+        job.meta = std::move(meta);
+        job.kv = std::make_shared<const std::vector<SessionKvSource>>(std::move(sources));
+        DeltaJob running = std::move(job);
+        uint64_t before = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            before = stats_.delta_bytes;
+        }
+        if (!delta_write_one(running)) {
+            if (fl_trace) std::fprintf(stderr, "strata flush image: delta write refused\n");
+            return 0;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            bytes = stats_.delta_bytes > before ? stats_.delta_bytes - before : 0;
+        }
+        if (fl_trace) std::fprintf(stderr, "strata flush image: delta %llu bytes\n", (unsigned long long) bytes);
+    } else {
+        // Nothing to append: either the chain is already current, or the disk holds no base for this conversation at
+        // all - and that one a hard kill loses outright, so the whole image goes now.
+        const std::string key = make_key(image.live.ids, image.live.imgs, image.cvec, id);
+        if (key.empty()) {
+            if (fl_trace) std::fprintf(stderr, "strata flush image: empty key\n");
+            return 0;
+        }
+        for (size_t slot = 0; slot < kConvDiskSlots; ++slot) {
+            Idx idx;
+            const std::string ipath = path_of_key(key, slot);
+            if (!read_idx(ipath, idx)) continue;
+            if (fl_trace)
+                std::fprintf(stderr, "strata flush image: idx %s model %llu/%llu config %llu/%llu cvec %u/%u\n",
+                             ipath.c_str(), (unsigned long long) idx.model, (unsigned long long) id.model,
+                             (unsigned long long) idx.config, (unsigned long long) id.config, (unsigned) idx.cvec,
+                             (unsigned) (image.cvec ? 1 : 0));
+            if (idx.model != id.model || idx.config != id.config || idx.cvec != (image.cvec ? 1 : 0)) continue;
+            if (fl_trace) std::fprintf(stderr, "strata flush image: the disk already holds it\n");
+            return 0;   // the disk already holds this conversation, or a chain that extends it
+        }
+        const bool wrote_whole = write_one(image, &bytes);
+        if (fl_trace)
+            std::fprintf(stderr, "strata flush image: whole write ok=%d bytes=%llu\n", (int) wrote_whole,
+                         (unsigned long long) bytes);
+        if (!wrote_whole) return 0;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::lock_guard<std::mutex> lk(mu_);
+    ++stats_.flushes;
+    stats_.flush_bytes += bytes;
+    stats_.last_flush_bytes = bytes;
+    stats_.last_flush_ms = ms;
+    return bytes;
+}
+
+inline bool ConversationDiskCache::write_one(const SavedConversation& image, uint64_t* written) {
     if (!identity_) return false;
     SessionFileIdentity id;
     std::string err;
@@ -663,6 +796,7 @@ inline bool ConversationDiskCache::write_one(SavedConversation& image) {
         std::lock_guard<std::mutex> lk(mu_);
         deltas_.erase(key);
     }
+    if (written != nullptr) *written = bytes;
     enforce_quota();
     return true;
 }
@@ -744,7 +878,8 @@ inline void ConversationDiskCache::enable_delta(int64_t min_tokens, int64_t sec,
 
 template <class Token>
 bool ConversationDiskCache::delta_due(const std::vector<Token>& ids, const std::vector<ConversationImageKey>& imgs,
-                                     bool cvec, int64_t live_tokens, ConvDiskDeltaInfo& out) {
+                                     bool cvec, int64_t live_tokens, ConvDiskDeltaInfo& out, int64_t min_growth,
+                                     bool respect_time, bool check_queue) {
     if (!delta_ || !enabled_ || !identity_) return false;
     SessionFileIdentity id;
     std::string err;
@@ -753,7 +888,7 @@ bool ConversationDiskCache::delta_due(const std::vector<Token>& ids, const std::
     if (key.empty()) return false;
     const int64_t now = now_ms();
     std::lock_guard<std::mutex> lk(mu_);
-    if (delta_writing_ || !delta_queue_.empty()) return false;   // one in flight: the next turn-end coalesces
+    if (check_queue && (delta_writing_ || !delta_queue_.empty())) return false;   // one in flight: the next turn-end coalesces
     auto it = deltas_.find(key);
     if (it == deltas_.end()) {
         ConvDiskDeltaInfo info;
@@ -813,8 +948,8 @@ bool ConversationDiskCache::delta_due(const std::vector<Token>& ids, const std::
         std::fprintf(stderr, "strata serve: conversation disk: delta due check %s: live %lld base %lld saved %lld min %lld at_ms %lld\n",
                      key.c_str(), (long long) live_tokens, (long long) st.base_tokens, (long long) st.saved_tokens,
                      (long long) delta_min_tokens_, (long long) st.at_ms);
-    if (live_tokens - st.saved_tokens < delta_min_tokens_) return false;
-    if (st.at_ms != 0 && now - st.at_ms < delta_sec_ * 1000) return false;
+    if (live_tokens - st.saved_tokens < (min_growth >= 0 ? min_growth : delta_min_tokens_)) return false;
+    if (respect_time && st.at_ms != 0 && now - st.at_ms < delta_sec_ * 1000) return false;
     out = st;
     return true;
 }

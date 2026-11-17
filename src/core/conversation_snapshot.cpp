@@ -538,6 +538,44 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     return true;
 }
 
+bool conversation_kv_image_sources(const SavedConversation& image, std::vector<SessionKvSource>& out,
+                                   std::string& error) {
+    out.clear();
+    if (image.kv.empty()) { error = "conversation image: no K/V layers"; return false; }
+    const int64_t block = strata::kernels::qsa_real_shapes().idx_block;
+    out.reserve(image.kv.size());
+    for (const auto& layer : image.kv) {
+        // 2026-11-18: `pending` is a lease held for the entry's whole life (its deleter joins the copy when the
+        // buffers are freed), not a "copy in flight" marker - skipping on it dropped every layer for ever.  The
+        // caller joins first (conversation_park_join / conversation_checkpoint_join) as the other readers do.
+        SessionKvSource s;
+        s.format = layer.format; s.cells = layer.cells; s.heads = layer.heads; s.head_dim = layer.head_dim;
+        s.page_size = layer.page_size; s.pooled_rows = layer.pooled_rows; s.idx_dim = layer.idx_dim;
+        s.idx_block = block;
+        // size() (the bytes actually carrying cells) - not bytes(), which is the segment capacity and runs past the
+        // last filled cell: the delta reader walks [cell_from, cell_to) against these, and a capacity-sized bound let it
+        // read past the payload ("parked K/V read out of range", 2026-11-18).
+        s.sizes = {layer.k.size(), layer.v.size(), layer.k_scale.size(), layer.v_scale.size(), layer.pooled.size()};
+        const std::array<const ConversationBuffer*, 5> parts = {
+            &layer.k, &layer.v, &layer.k_scale, &layer.v_scale, &layer.pooled};
+        const auto sizes = s.sizes;
+        auto why = std::make_shared<std::string>();
+        s.read = [parts, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
+            if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) {
+                *why = "parked K/V read out of range";
+                return false;
+            }
+            if (parts[part]->read(dst, offset, n)) return true;
+            *why = "parked K/V read out of range";
+            return false;
+        };
+        s.error = [why] { return *why; };
+        out.push_back(std::move(s));
+    }
+    if (out.empty()) { error = "conversation image: every layer is still being copied"; return false; }
+    return true;
+}
+
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                             int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
     conversation_park_join();

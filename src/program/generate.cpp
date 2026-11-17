@@ -1098,6 +1098,16 @@ struct Options {
     int64_t conversation_disk_delta_sec = 60;
     int64_t conversation_disk_delta_min_tokens = 1024;
     int64_t conversation_disk_delta_compact_pct = 20;
+    /// --conversation-cache-disk-flush-sec N: once the engine has been idle N seconds, a thread puts what the RAM
+    /// conversation cache parks onto the disk tier from the bytes already in RAM - the growth of a parked
+    /// conversation appended to its chain, or its whole image where the disk has no file for it yet.  A machine
+    /// shutdown kills the engine without a QUIT, and the last thing a clean stop writes is what a hard kill loses.
+    /// 0 = off, which leaves the write paths exactly as they were.  --conversation-cache-disk-flush-growth is how many
+    /// tokens past the newest point on a chain make an append worth it (idle time is free, so it is far below the
+    /// turn-end threshold), and --conversation-cache-disk-flush-images how many parked conversations one pass looks at.
+    int64_t conversation_disk_flush_sec = 0;
+    int64_t conversation_disk_flush_growth = 256;
+    int64_t conversation_disk_flush_images = 3;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1299,6 +1309,17 @@ void usage() {
                  "  --conversation-disk-delta-min-tokens N  --serve: the shortest growth an append is worth (default 1024)\n"
                  "  --conversation-disk-delta-compact-pct N  --serve: the chain size, as a percentage of its base file,\n"
                  "                       that folds it back into one file (default 20)\n"
+                 "  --conversation-cache-disk-flush-sec N  --serve (opt-in, needs --conversation-cache-disk): once the\n"
+                 "                       engine has been idle N seconds, put the conversations the RAM cache parks on the\n"
+                 "                       disk from the bytes already there - a turn's growth appended, or the whole image\n"
+                 "                       when the disk has no file for it yet.  A machine shutdown kills the engine\n"
+                 "                       without a QUIT; this is what it finds on the disk (default 0 = off)\n"
+                 "  --conversation-cache-disk-flush-growth N  --serve: how many tokens a parked conversation must have\n"
+                 "                       grown past the newest thing on its chain before an idle pass appends it\n"
+                 "                       (default 256; far smaller than the turn-end --conversation-disk-delta-min-tokens,\n"
+                 "                       because an idle window is free time)\n"
+                 "  --conversation-cache-disk-flush-images N  --serve: how many parked conversations one idle pass looks\n"
+                 "                       at, least recently active first (default 3)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -1913,6 +1934,12 @@ static int64_t gpu_pause_now() {
 /// The same counter when the engine last went idle (READY, then the end of every request): the next request's begin reports a pause that
 /// happened in between.  Only the request loop's thread touches it.
 static strata::core::GpuPauseIdle g_gpu_pause_idle;
+// The parked-conversation cache has no lock of its own: every mutation of it comes from the serve thread's request
+// path.  --conversation-cache-disk-flush-sec adds a second reader, a thread that writes what the cache parks to the
+// disk while the engine is quiet, so the request path holds this for its whole turn (BusyScope) and that thread
+// takes it with try_lock: a flush only ever runs between requests, and a request never queues behind a flush it did
+// not start - at most behind one already in progress, a single conversation's write.
+static std::mutex g_conv_scope;
 constexpr int64_t kVramSafeMib =
 #ifdef _WIN32
     1024;   // WDDM pages instead of failing (docs/DETAILS.md, the sysmem fallback): the line #2065 fell below
@@ -3948,6 +3975,20 @@ int main(int argc, char** argv) {
             if (a == "--conversation-disk-delta-sec") o.conversation_disk_delta_sec = number;
             else if (a == "--conversation-disk-delta-min-tokens") o.conversation_disk_delta_min_tokens = number;
             else o.conversation_disk_delta_compact_pct = number;
+        }
+        else if (a == "--conversation-cache-disk-flush-sec" || a == "--conversation-cache-disk-flush-growth" ||
+                 a == "--conversation-cache-disk-flush-images") {
+            const std::string value = next(a.c_str());
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 ||
+                number > (int64_t) 1 << 20) {
+                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+                return 2;
+            }
+            if (a == "--conversation-cache-disk-flush-sec") o.conversation_disk_flush_sec = number;
+            else if (a == "--conversation-cache-disk-flush-growth") o.conversation_disk_flush_growth = number;
+            else o.conversation_disk_flush_images = number;
         }
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -16781,6 +16822,90 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+        // --conversation-cache-disk-flush-sec: the idle flusher.  After N seconds of a quiet engine it walks what the
+        // RAM conversation cache parks and hands each conversation to the disk tier, read out of the bytes already in
+        // RAM: the growth since the newest point on its chain appended to the chain, or the whole image where the disk
+        // holds no file for it yet.  A machine shutdown kills this process without a QUIT - this is what it leaves on
+        // the disk - and a conversation the RAM cache evicts later is already written, so the eviction pays no write.
+        // Nothing is moved out of the cache and no host copy of an image is made: the conversation stays warm in RAM.
+        // Off unless the flag is given; with it off no thread exists and the write paths are exactly what they were.
+        std::thread conv_flusher;
+        std::atomic<bool> conv_flusher_stop{false};
+        // Joined on any way out of the serve loop (QUIT, an error return, an exception): a joinable thread whose
+        // destructor runs would end the process.
+        struct FlushJoin {
+            std::thread* thread;
+            std::atomic<bool>* stop;
+            ~FlushJoin() {
+                if (!thread->joinable()) return;
+                stop->store(true);
+                thread->join();
+            }
+        } flush_join{&conv_flusher, &conv_flusher_stop};
+        if (conv_disk.enabled() && o.conversation_disk_flush_sec > 0) {
+            const int64_t f_sec = std::max<int64_t>(5, o.conversation_disk_flush_sec);
+            const int64_t f_growth = std::max<int64_t>(1, o.conversation_disk_flush_growth);
+            const int64_t f_images = std::max<int64_t>(1, o.conversation_disk_flush_images);
+            const uint64_t f_floor = (uint64_t) std::max<int64_t>(0, o.conversation_cache_min_free_mib) << 20;
+            const int64_t poll_ms = std::max<int64_t>(500, std::min<int64_t>(f_sec * 250, (int64_t) 2000));
+            const bool f_trace = std::getenv("STRATA_DELTA_TRACE") != nullptr;
+            std::fprintf(stderr,
+                         "strata serve: conversation disk: idle flush every %lld s of quiet (growth %lld tokens, "
+                         "%lld parked conversation(s) per pass)\n",
+                         (long long) f_sec, (long long) f_growth, (long long) f_images);
+            conv_flusher = std::thread([&, f_sec, f_growth, f_images, f_floor, poll_ms] {
+                int64_t quiet_ms = 0;
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+                    if (conv_flusher_stop.load()) return;
+                    if (strata::core::progress().busy.load()) { if (f_trace && quiet_ms > 0) std::fprintf(stderr, "strata serve: idle flush trace: quiet reset by busy (`%lld ms so far`)\n", (long long) quiet_ms); quiet_ms = 0; continue; }
+                    quiet_ms += poll_ms;
+                    if (quiet_ms < f_sec * 1000) continue;
+                    quiet_ms = 0;
+                    // Between requests only: a request path holding the scope means one just started, and the growth
+                    // this pass would write is still there for the next quiet window.
+                    std::unique_lock<std::mutex> scope(g_conv_scope, std::try_to_lock);
+                    if (!scope.owns_lock()) { if (f_trace) std::fprintf(stderr, "strata serve: idle flush trace: a request holds the scope\n"); continue; }
+                    if (conv_flusher_stop.load()) return;
+                    if (!conv_disk.ready()) { if (f_trace) std::fprintf(stderr, "strata serve: idle flush trace: disk tier not ready\n"); continue; }   // the identity is resolved at the first request
+                    const auto mem = strata::core::sample_host_memory();
+                    if (!mem || mem->available < f_floor + ((uint64_t) 1 << 30)) { if (f_trace) std::fprintf(stderr, "strata serve: idle flush trace: low RAM (need %llu MiB, available %llu MiB)\n", (unsigned long long) ((f_floor + ((uint64_t) 1 << 30)) >> 20), (unsigned long long) (mem ? (mem->available >> 20) : 0)); continue; }   // the park's floor, +1 GiB
+                    const auto t0 = Clock::now();
+                    size_t wrote = 0, seen = 0;
+                    uint64_t bytes = 0;
+                    // The parked images' K/V and running state may still be landing on a background thread
+                    // (STRATA_PARK_ASYNC / STRATA_CKPT_ASYNC): join before reading their buffers, exactly as the
+                    // other readers of a parked image do.  Both are no-ops once nothing is in flight.
+                    strata::core::conversation_checkpoint_join(nullptr);
+                    strata::core::conversation_park_join();
+                    seen = conversations.flush_visit((size_t) f_images,
+                                                     [&](const strata::core::SavedConversation& img) {
+                                                         std::vector<strata::core::SessionKvSource> sources;
+                                                         std::string serr;
+                                                         if (!strata::core::conversation_kv_image_sources(img, sources,
+                                                                                                         serr))
+                                                             {
+                                                                 std::fprintf(stderr, "strata serve: idle flush: no sources: %s\n", serr.c_str());
+                                                                 return;
+                                                             }
+                                                         const uint64_t n = conv_disk.flush_image(img, f_growth,
+                                                                                                std::move(sources));
+                                                         if (n) { ++wrote; bytes += n; }
+                                                     });
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                    if (f_trace)
+                        std::fprintf(stderr, "strata serve: idle flush trace: visit seen=%zu wrote=%zu bytes=%llu "
+                                             "in %.0f ms\n", seen, wrote, (unsigned long long) bytes, ms);
+                    if (wrote)
+                        std::fprintf(stderr, "strata serve: conversation disk: idle flush: %zu conversation(s), "
+                                             "%.2f GiB in %.0f ms (%zu parked)\n",
+                                     wrote, (double) bytes / 1073741824.0, ms, conversations.size());
+                    else if (std::getenv("STRATA_DELTA_TRACE") != nullptr && seen)
+                        std::fprintf(stderr, "strata serve: conversation disk: idle flush: %zu conversation(s), "
+                                             "nothing new to write\n", seen);
+                }
+            });
+        }
         for (;;) {
             line_drain_ms = 0.0;
             strata::core::manifest::instance().flush_if_dirty("request");   // STRATA_MANIFEST: what the last request added (a no-op when off)
@@ -16890,6 +17015,12 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") {
+                // The idle flusher stops first: it reads the parked conversations, and the park and drain below move
+                // every one of them.  flush_join only covers an exit that skips this branch.
+                if (conv_flusher.joinable()) {
+                    conv_flusher_stop.store(true);
+                    conv_flusher.join();
+                }
                 // The disk tier takes what the RAM cache still parks, then the engine answers QUIT.  The conversation
                 // this engine served last is still LIVE (in a batch slot, or in the main session) - it was never parked,
                 // because only the next request parks the previous one.  Park it here first, so a stop keeps the newest
@@ -16906,6 +17037,10 @@ int main(int argc, char** argv) {
             }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
+                // the conversation scope: the idle disk flusher (--conversation-cache-disk-flush-sec) reads the parked
+                // conversations from its own thread and holds this for its whole pass, so the cache cannot move an
+                // entry, park one or drop the whole thing while a file is being written from its buffers
+                std::unique_lock<std::mutex> conv_scope{g_conv_scope};
                 BusyScope() {
                     strata::core::progress().allow_until_ms.store(0);
                     strata::core::progress().busy.store(true);

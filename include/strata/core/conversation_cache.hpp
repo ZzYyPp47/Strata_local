@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <functional>
@@ -314,6 +315,42 @@ public:
         int64_t n = 0;
         for (const auto& e : entries_) n = std::max<int64_t>(n, (int64_t) e.live.ids.size());
         return n;
+    }
+
+    /// --conversation-cache-disk-flush-sec: walk the parked conversations for the idle disk flush, least recently
+    /// active first - the order `drop_oldest` frees them in, so what is written first is what an eviction or a hard
+    /// kill would lose first, and the one nobody is about to resume.  `fn` sees only an entry a file write can read
+    /// safely: not a layer split (the disk tier keeps one file per conversation), not under
+    /// --conversation-cache-min-tokens, and not one whose K/V or running state a STRATA_PARK_ASYNC /
+    /// STRATA_CKPT_ASYNC copy is still filling.  At most `limit` entries are passed; returns how many.
+    /// `fn` must not change the cache: a writer reads an entry's buffers, and a park or eviction at the same moment
+    /// moves or frees them.  The caller holds the engine's conversation scope (generate.cpp's BusyScope) for the
+    /// whole pass, which keeps every request, park and eviction out.
+    template<class Fn> size_t flush_visit(size_t limit, Fn fn) const {
+        size_t seen = 0;
+        const bool trace = std::getenv("STRATA_DELTA_TRACE") != nullptr;
+        for (const auto& e : entries_) {
+            if (seen >= limit) break;
+            if (e.stage_images.size() > 1) {
+                if (trace) std::fprintf(stderr, "strata flush visit: skip %zu tokens: %zu stage images\n",
+                                        e.live.ids.size(), e.stage_images.size());
+                continue;
+            }
+            if (!wants((int64_t) e.live.ids.size())) {
+                if (trace) std::fprintf(stderr, "strata flush visit: skip %zu tokens: below min tokens\n",
+                                        e.live.ids.size());
+                continue;
+            }
+            // (2026-11-18) `e.pending`, `e.live_pending` and `layer.pending` are NOT "a copy is in flight"
+            // markers: they are leases held for the entry's whole life (their deleters join the copy when the
+            // buffers are freed, see conversation_state.cpp's live_pending).  Skipping on them skipped every
+            // parked conversation for ever.  The reader joins instead: conversation_checkpoint_join(nullptr) +
+            // conversation_park_join() before the pass.
+            ++seen;
+            fn(e);
+        }
+        if (trace) std::fprintf(stderr, "strata flush visit: %zu entries, %zu passed\n", entries_.size(), seen);
+        return seen;
     }
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.

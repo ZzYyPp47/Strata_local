@@ -49,6 +49,13 @@ bool conversation_kv_source(SessionKvSource& source, const QsaState& state, cons
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
+// The same kind of streamed source over a PARKED conversation's own host buffers: the idle disk flush
+// (--conversation-cache-disk-flush-sec) has no live session to read from, and for a parked conversation the host
+// copy in the cache IS the authoritative payload.  The caller holds the conversation scope, so the buffers stay put
+// while the writer reads them; no bytes are copied here.  A layer whose STRATA_PARK_ASYNC fill has not landed is
+// skipped, so an empty result says nothing could be read.
+bool conversation_kv_image_sources(const SavedConversation& image, std::vector<SessionKvSource>& out,
+                                   std::string& error);
 // Disk sessions: the read limits this session can ever restore - its geometry and layer range, at most
 // min(max_tokens, its cells) tokens, `max_checkpoints` checkpoints, the exact running-state sizes and the K/V part
 // sizes at that many tokens - so session_file_read refuses an oversized or foreign file before it allocates.
