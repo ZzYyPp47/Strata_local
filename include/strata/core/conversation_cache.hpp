@@ -8,7 +8,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -264,7 +266,13 @@ public:
     };
 
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
-        : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
+        : budget_(budget), slots_(slots), min_tokens_(min_tokens),
+          // STRATA_CONV_CACHE_EVICT_SMALLEST: evict the smallest parked conversation that may go instead of the
+          // oldest one.  Read once here (as every other engine switch), so a park pays no getenv.
+          evict_smallest_([] {
+              const char* e = std::getenv("STRATA_CONV_CACHE_EVICT_SMALLEST");
+              return e != nullptr && e[0] == '1' && e[1] == '\0';
+          }()) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
@@ -282,6 +290,25 @@ public:
     size_t resident_bytes() const { return bytes() + pool_idle_bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
+    /// whether this cache evicts the smallest parked conversation that may go (STRATA_CONV_CACHE_EVICT_SMALLEST=1);
+    /// said once at serve start so a run can be told apart from the default oldest-first order by its log alone.
+    bool evict_smallest() const { return evict_smallest_; }
+    /// --conversation-cache-disk: where an image drop_oldest() would free goes before it is freed (the disk tier takes
+    /// it and writes it out).  Empty by default, so an engine without a disk cache behaves exactly as before.  The
+    /// #879 poison path (clear()) never calls it: those images must not reach a file.
+    void set_evict_hook(std::function<void(SavedConversation&&)> hook) { evict_hook_ = std::move(hook); }
+    bool has_evict_hook() const { return static_cast<bool>(evict_hook_); }
+    /// Moves every parked conversation out (the QUIT flush of the disk tier).  Poison must use clear(), not this.
+    std::vector<SavedConversation> drain_all() {
+        std::vector<SavedConversation> out;
+        out.reserve(entries_.size());
+        for (auto& e : entries_) out.push_back(std::move(e));
+        entries_.clear();
+        serials_.clear();
+        bytes_ = 0;
+        reuse_ = {};
+        return out;
+    }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
         int64_t n = 0;
@@ -560,15 +587,31 @@ private:
     }
     // evict_oldest() without handing the memory back (make_room's loop)
     bool drop_oldest() {
-        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
+        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor;
+        // STRATA_CONV_CACHE_EVICT_SMALLEST: the SMALLEST such entry instead, ties going to the oldest of them.
+        // A parked conversation costs its whole re-prefill to rebuild (measured: 224593 tokens = 4.2 GiB parked, and
+        // a 202692-token prompt reads 39.2 s), so when the budget or the RAM floor forces one out, dropping a short
+        // side conversation loses less work than dropping the long one that the queries keep coming back to.
+        size_t pick = entries_.size();
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes();
-            erase(i);
+            if (pick == entries_.size() ||
+                (evict_smallest_ && entries_[i].bytes() < entries_[pick].bytes())) pick = i;
+        }
+        if (pick == entries_.size()) return false;
+        const size_t gone = entries_[pick].bytes();
+        bytes_ -= gone;
+        if (evict_hook_) {
+            // the disk tier takes the image (a move: bytes_ was already accounted), then it is erased here
+            SavedConversation image = std::move(entries_[pick]);
+            erase(pick);
             ++evictions_;
+            evict_hook_(std::move(image));
             return true;
         }
-        return false;
+        erase(pick);
+        ++evictions_;
+        return true;
     }
     void erase(size_t index) {
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
@@ -580,6 +623,8 @@ private:
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
+    bool evict_smallest_ = false;   // STRATA_CONV_CACHE_EVICT_SMALLEST=1: drop_oldest() picks the smallest entry
+    std::function<void(SavedConversation&&)> evict_hook_;   // --conversation-cache-disk (empty: nothing changes)
     ConversationKvReuse reuse_;
     SegmentPoolBudget* pool_ = nullptr;   // STRATA_PARK_SEGPOOL_MIB (not owned)
 };

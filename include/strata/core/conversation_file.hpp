@@ -170,6 +170,10 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 struct SessionKvSource {
     int format = 0;
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
+    // Tokens per pooled indexer row (0: unknown, the increment then stores that part whole): a segment of
+    // [prev, live) tokens rewrites the pooled rows [prev / idx_block, live / idx_block + 1), the leading 512-byte
+    // row of `idx_dim` floats included, so only a growing conversation's new rows are written.
+    int64_t idx_block = 0;
     std::array<size_t, 5> sizes{};
     std::function<bool(size_t part, size_t offset, void* dst, size_t n)> read;
     std::function<std::string()> error;

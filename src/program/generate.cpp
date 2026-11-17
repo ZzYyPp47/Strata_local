@@ -43,6 +43,7 @@
 #include "strata/core/lookup_default.hpp"
 #include "strata/core/serve_stop_bound.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_disk_cache.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/park_pool_policy.hpp"
@@ -1080,6 +1081,23 @@ struct Options {
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
     int64_t conversation_cache_park_gain = 0;
+    /// --conversation-cache-disk DIR: the third tier under the RAM cache: a parked conversation the RAM cache pushes
+    /// out (or still holds at QUIT) is written to a file under DIR, and the next request for it reads it back instead
+    /// of prefilling it again.  Empty = off (the default path is unchanged, byte for byte).
+    std::string conversation_cache_disk;
+    /// --conversation-cache-disk-gb N: the disk budget (GiB; default 700, 0 = unlimited).  Over it, the files used
+    /// longest ago go first.
+    int64_t conversation_cache_disk_gb = 700;
+    /// --conversation-cache-disk-delta: with --conversation-cache-disk, a turn that advanced the conversation by at
+    /// least --conversation-disk-delta-min-tokens appends only the new pages to <file>.delta beside the snapshot,
+    /// instead of copying the whole snapshot again; once the chain passes --conversation-disk-delta-compact-pct of the
+    /// file it is folded back into a fresh one.  A turn that advanced less, or ended within
+    /// --conversation-disk-delta-sec of the last append, is coalesced into the next one.  Off by default: the
+    /// full-write path is the default path, unchanged.
+    bool conversation_cache_disk_delta = false;
+    int64_t conversation_disk_delta_sec = 60;
+    int64_t conversation_disk_delta_min_tokens = 1024;
+    int64_t conversation_disk_delta_compact_pct = 20;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1268,6 +1286,19 @@ void usage() {
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
+                 "  --conversation-cache-disk DIR  --serve: a third tier under the RAM cache: a parked conversation the\n"
+                 "                       RAM cache pushes out (or still holds at QUIT) is written under DIR, and the next\n"
+                 "                       request for it reads that file back instead of prefilling it again (default off)\n"
+                 "  --conversation-cache-disk-gb N  --serve: the disk budget of --conversation-cache-disk (GiB; default\n"
+                 "                       700, 0 = unlimited; over it the files used longest ago go first)\n"
+                 "  --conversation-cache-disk-delta  --serve (opt-in, needs --conversation-cache-disk): write only what\n"
+                 "                       a turn grew the conversation by, appended to <file>.delta, instead of the whole\n"
+                 "                       snapshot again; past --conversation-disk-delta-compact-pct it folds back into one\n"
+                 "  --conversation-disk-delta-sec N  --serve: the shortest gap between two appends of one conversation\n"
+                 "                       (default 60; a turn ending sooner is coalesced into the next one)\n"
+                 "  --conversation-disk-delta-min-tokens N  --serve: the shortest growth an append is worth (default 1024)\n"
+                 "  --conversation-disk-delta-compact-pct N  --serve: the chain size, as a percentage of its base file,\n"
+                 "                       that folds it back into one file (default 20)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -3891,6 +3922,33 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
+        else if (a == "--conversation-cache-disk") o.conversation_cache_disk = next("--conversation-cache-disk");
+        else if (a == "--conversation-cache-disk-gb") {
+            const std::string value = next(a.c_str());
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 ||
+                number > (int64_t) 1 << 20) {
+                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+                return 2;
+            }
+            o.conversation_cache_disk_gb = number;
+        }
+        else if (a == "--conversation-cache-disk-delta") o.conversation_cache_disk_delta = true;
+        else if (a == "--conversation-disk-delta-sec" || a == "--conversation-disk-delta-min-tokens" ||
+                 a == "--conversation-disk-delta-compact-pct") {
+            const std::string value = next(a.c_str());
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 ||
+                number > (int64_t) 1 << 20) {
+                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+                return 2;
+            }
+            if (a == "--conversation-disk-delta-sec") o.conversation_disk_delta_sec = number;
+            else if (a == "--conversation-disk-delta-min-tokens") o.conversation_disk_delta_min_tokens = number;
+            else o.conversation_disk_delta_compact_pct = number;
+        }
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
@@ -12989,6 +13047,34 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // STRATA_CONV_CACHE_EVICT_SMALLEST: said once, so a run's log alone says which order pushed parked
+        // conversations out (the default is the least recently active one).
+        if (conversations.evict_smallest())
+            std::fprintf(stderr, "strata serve: conversation cache: eviction order: smallest parked conversation first (STRATA_CONV_CACHE_EVICT_SMALLEST)\n");
+        // --conversation-cache-disk: the third tier below VRAM and the RAM cache.  A parked conversation the RAM cache
+        // pushes out (or still holds at QUIT) goes to a file under DIR; the next request for it reads that file back,
+        // puts it into the RAM cache and the existing restore path takes over - no cold prefill.  Declared beside the
+        // cache so the serve loop's lambdas see it; the identity (model x resolved config) is resolved at the first
+        // request, where session_identity exists, and the eviction hook is attached there.
+        strata::core::ConversationDiskCache conv_disk(
+            o.prompt_cache > 0 ? o.conversation_cache_disk : std::string(),
+            o.conversation_cache_disk_gb > 0 ? ((uint64_t) o.conversation_cache_disk_gb << 30) : 0,
+            std::max<int64_t>(o.conversation_cache_min_tokens, 2048),
+            o.session_min_free_mib > 0 ? ((uint64_t) o.session_min_free_mib << 20) : ((uint64_t) 1 << 30));
+        if (conv_disk.enabled())
+            std::fprintf(stderr,
+                         "strata serve: conversation disk: %s (%lld GiB cap) - an evicted or QUIT-parked conversation "
+                         "is written there and read back instead of being prefilled again\n",
+                         conv_disk.dir().c_str(), (long long) o.conversation_cache_disk_gb);
+        if (conv_disk.enabled() && o.conversation_cache_disk_delta) {
+            conv_disk.enable_delta(o.conversation_disk_delta_min_tokens, o.conversation_disk_delta_sec,
+                                   (int) o.conversation_disk_delta_compact_pct);
+            std::fprintf(stderr,
+                         "strata serve: conversation disk: increments on - a turn that grows a conversation by %lld "
+                         "tokens (and ends %lld s after the last append) writes only that part; folded back past %lld%%\n",
+                         (long long) o.conversation_disk_delta_min_tokens, (long long) o.conversation_disk_delta_sec,
+                         (long long) o.conversation_disk_delta_compact_pct);
+        }
         // The park pools (park_pool_policy.hpp): memory held idle between parks so a park does not pay the first touch of fresh pages.
         //   * the segment pool: one arena for the K/V buffers of parked conversations (STRATA_PARK_SEGPOOL_MIB=N sets its size, 0 turns it
         //     off; unset: min(2 GiB, a quarter of the cache); Linux only, the OS layer of Windows and macOS is not written yet: inert there);
@@ -15750,6 +15836,7 @@ int main(int argc, char** argv) {
         // allocation that ran out) are logged and the slot is overwritten as before.  Nothing here ends the request
         // or the engine.
         auto park_slot = [&](int b) {
+            conv_disk.delta_join();   // an increment reading this slot's K/V must be done before anything moves it
             BSlot& sl = bs[(size_t) b];
             if (!conversations.enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return;
             auto prefix_of = [&](const std::vector<int32_t>& whole) {
@@ -15799,6 +15886,50 @@ int main(int argc, char** argv) {
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking slot %d\n", b);
             }
+        };
+        // --conversation-cache-disk-delta: a finished turn appends what the conversation grew by to its .delta chain,
+        // read straight out of the slot's sessions (no host copy of the K/V).  A turn that grew by less than the
+        // minimum, or ended within the coalescing window of the last append, is left to the next one: the chain is one
+        // write per conversation per window, not one per turn.  The slot must stay untouched until the writer is done,
+        // which is what delta_join() before every admission guarantees.
+        auto delta_turn_end = [&](int b) {
+            static const bool dtrace = std::getenv("STRATA_DELTA_TRACE") != nullptr;
+            const bool on = conv_disk.enabled() && conv_disk.delta_enabled();
+            const bool slot_ok = batch_mtp && use_mtp && b >= 0 && (size_t) b < bs.size() &&
+                                 (size_t) b < slot_mtp.size() && slot_mtp[(size_t) b] != nullptr;
+            BSlot& sl = bs[(size_t) b < bs.size() ? (size_t) b : 0];
+            if (dtrace)
+                std::fprintf(stderr,
+                             "strata serve: conversation disk: delta hook slot %d: on %d batch_mtp %d use_mtp %d ids %zu "
+                             "cached %d active %d img %d partial %d tainted %d stages %zu\n",
+                             b, (int) on, (int) batch_mtp, (int) use_mtp, sl.ids.size(), (int) sl.cached,
+                             (int) sl.active, (int) sl.img, (int) sl.partial, (int) sl.tainted, stages.size());
+            if (!on || !slot_ok) return;
+            if (sl.active || sl.img || sl.partial || sl.tainted || !sl.cached || sl.ids.empty()) return;
+            if (!stages.empty()) return;   // a layer split streams its stages separately: no increment for it
+            if (cudaDeviceSynchronize() != cudaSuccess) return;   // the state and the K/V are copied off a still device
+            static const std::vector<ImgKey> no_imgs;
+            strata::core::ConvDiskDeltaInfo info;
+            if (!conv_disk.delta_due(sl.ids, no_imgs, sl.cvec, (int64_t) sl.ids.size(), info)) return;
+            const strata::core::ConversationView view{sl.ids, no_imgs, sl.checks, sl.cvec};
+            strata::core::SavedConversation meta;
+            std::vector<strata::core::SessionKvSource> sources;
+            std::string derr;
+            if (!strata::core::conversation_snapshot_sources(meta, sources, view, *bslot_ss[0][(size_t) b], g,
+                                                            slot_mtp[(size_t) b]->kv_state(), derr)) {
+                std::fprintf(stderr, "strata serve: conversation disk: no increment for slot %d (%s)\n", b,
+                             derr.c_str());
+                return;
+            }
+            strata::core::ConversationDiskCache::DeltaJob job;
+            job.key = info.key;
+            job.path = info.path;
+            job.base_tokens = info.base_tokens;
+            job.prev_live = info.prev_live;
+            job.base_bytes = info.base_bytes;
+            job.meta = std::move(meta);
+            job.kv = std::make_shared<const std::vector<strata::core::SessionKvSource>>(std::move(sources));
+            conv_disk.delta_submit(std::move(job));
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
@@ -16008,6 +16139,7 @@ int main(int argc, char** argv) {
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        delta_turn_end(b);
                         break;
                     }
                     sl.x = y;
@@ -16318,6 +16450,7 @@ int main(int argc, char** argv) {
                         // a cache again (#857), as on the pipelined path without drafts: final once its commits have run
                         // (pmtp_settle, before anything reads the slot's sessions)
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        if (!pmtp) delta_turn_end(blk.b);
                         break;
                     }
                     sl.x = y;
@@ -16731,6 +16864,8 @@ int main(int argc, char** argv) {
             }
             if (trace && slid)
                 std::fprintf(stderr, "strata batch: admission drain slid (the tier was already idle, copies done)\n");
+            // an increment still reading the main session or a slot must be done before this request touches either
+            if (conv_disk.enabled()) conv_disk.delta_join();
             admit_slot = -1;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
@@ -16754,7 +16889,21 @@ int main(int argc, char** argv) {
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
-            if (line == "QUIT") break;
+            if (line == "QUIT") {
+                // The disk tier takes what the RAM cache still parks, then the engine answers QUIT.  The conversation
+                // this engine served last is still LIVE (in a batch slot, or in the main session) - it was never parked,
+                // because only the next request parks the previous one.  Park it here first, so a stop keeps the newest
+                // conversation too instead of losing the one the user just finished.
+                if (conv_disk.enabled() && conv_disk.ready()) {
+                    for (int b = 0; b < (int) bs.size(); ++b) park_slot(b);
+                    park_current(0);
+                }
+                if (conv_disk.enabled()) {
+                    conv_disk.flush(conversations.drain_all(), 120);
+                    std::fprintf(stderr, "strata serve: conversation %s\n", conv_disk.summary().c_str());
+                }
+                break;
+            }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() {
@@ -17594,6 +17743,36 @@ int main(int argc, char** argv) {
                                          "(its embeddings changed): it cannot be reused (#2228)\n", (long long) deep,
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
+            }
+            // ---- conversation disk (--conversation-cache-disk): VRAM -> RAM cache -> disk ----
+            // The RAM cache answers first.  A miss, and the disk is asked for this token prefix: a hit lands in the RAM
+            // cache, so the lines below take the same path a hot conversation takes (restore, never a cold prefill).
+            if (conv_disk.enabled()) {
+                if (!conv_disk.ready()) {
+                    strata::core::SessionFileIdentity disk_id;
+                    std::string disk_err;
+                    if (session_identity(disk_id, disk_err, [] {})) {
+                        conv_disk.set_identity([disk_id](strata::core::SessionFileIdentity& out, std::string&) {
+                            out = disk_id;
+                            return true;
+                        });
+                        conv_disk.attach(&conversations);
+                        conversations.set_evict_hook([&conv_disk](strata::core::SavedConversation&& img) {
+                            conv_disk.enqueue(std::move(img));
+                        });
+                        std::fprintf(stderr, "strata serve: conversation disk: armed (model %016llx config %016llx)\n",
+                                     (unsigned long long) disk_id.model, (unsigned long long) disk_id.config);
+                        // The newest two files are read once, now: after a restart the first request finds its image
+                        // already parsed, so it pays no disk read.  Bounded by design (two images, not a directory).
+                        conv_disk.prewarm(2);
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation disk: off (%s)\n", disk_err.c_str());
+                        conv_disk.close();
+                    }
+                }
+                if (conv_disk.ready() && !ids.empty() &&
+                    conversations.best(ids, req_imgs, want_cvec).tokens <= std::max(resume, slot_tokens))
+                    conv_disk.recall(ids, req_imgs, want_cvec);
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
@@ -18701,6 +18880,7 @@ int main(int argc, char** argv) {
                     if (segs.size() < 2) return sp.run(lead.tokens, lead.n, lead.pos0, ce);
                     for (const CoReq* c : used) {
                         park_slot(c->slot);   // the conversation the slot holds, before this read overwrites it
+                        conv_disk.delta_join();
                         for (size_t k = 0; k < bslot_ss.size(); ++k) {
                             const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                             strata::core::session_zero(*bslot_ss[k][(size_t) c->slot], g, nullptr, nullptr);
@@ -18722,6 +18902,7 @@ int main(int argc, char** argv) {
                     }
                     for (const CoReq* c : used) {
                         BSlot& sl = bs[(size_t) c->slot];
+                        conv_disk.delta_join();
                         sl = BSlot{};
                         sl.ids.assign(c->ids.begin(), c->ids.end() - 1);
                         sl.cached = true;
@@ -18841,6 +19022,7 @@ int main(int argc, char** argv) {
                     const auto ty = Clock::now();
                     std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
                     if (can) park_slot(ys);   // the conversation the slot holds, before this read overwrites it
+                    conv_disk.delta_join();
                     if (can && copy_to_slot(ys, pre, ye)) {
                         BSlot& sl = bs[(size_t) ys];
                         sl = BSlot{};
@@ -21100,6 +21282,35 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
             }
+            // --conversation-cache-disk-delta on the solo path: this request read and decoded in the main session, so
+            // `live` is the conversation an increment reads (the batch slots have their own turn end in the windows).
+            // Only the part the base does not cover yet is written, through sources over the live K/V.
+            if (conv_disk.enabled() && conv_disk.delta_enabled() && live_ok && !cancelled && admit_slot < 0 &&
+                !live.empty() && req_imgs.empty() && stages.empty() && (int64_t) live.size() >= 2000 &&
+                cudaDeviceSynchronize() == cudaSuccess) {
+                strata::core::ConvDiskDeltaInfo dinfo;
+                if (conv_disk.delta_due(live, live_imgs, cvec_cached, (int64_t) live.size(), dinfo)) {
+                    strata::core::ConversationView dview{live, live_imgs, checks, cvec_cached};
+                    strata::core::SavedConversation dmeta;
+                    std::vector<strata::core::SessionKvSource> dsources;
+                    std::string derr;
+                    if (strata::core::conversation_snapshot_sources(dmeta, dsources, dview, ss, g, mtp.kv_state(),
+                                                                    derr)) {
+                        strata::core::ConversationDiskCache::DeltaJob job;
+                        job.key = dinfo.key;
+                        job.path = dinfo.path;
+                        job.base_tokens = dinfo.base_tokens;
+                        job.prev_live = dinfo.prev_live;
+                        job.base_bytes = dinfo.base_bytes;
+                        job.meta = std::move(dmeta);
+                        job.kv = std::make_shared<const std::vector<strata::core::SessionKvSource>>(
+                            std::move(dsources));
+                        conv_disk.delta_submit(std::move(job));
+                    } else if (std::getenv("STRATA_DELTA_TRACE") != nullptr) {
+                        std::fprintf(stderr, "strata serve: conversation disk: no increment (%s)\n", derr.c_str());
+                    }
+                }
+            }
             if (nib::config().recheck && nib::any_on() && !cancelled) {
                 // STRATA_EXPERT_NIBBLE_RECHECK=1 (debug): every converted slot's hash again on its own device, against the
                 // hash recorded at load - a path that wrote a slot after the seal is found here
@@ -21278,6 +21489,7 @@ int main(int argc, char** argv) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
+                    conv_disk.delta_join();   // (as in park_slot: the slot is about to be reused)
                     BSlot& sl = bs[(size_t) admit_slot];
                     if (ckpt_pool.on())
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
@@ -22740,6 +22952,15 @@ int main(int argc, char** argv) {
                 std::fprintf(hashes, "%lld %lld %d %016llx", (long long) rounds, (long long) p, T, (unsigned long long) h);
                 for (int i = 0; i < T; ++i) std::fprintf(hashes, " %d", (int) outv[(size_t) i]);
                 std::fprintf(hashes, "\n");
+            }
+            if (final_r != nullptr) {   // --dump-final-r: a window's final residuals (the native pack's only exit)
+                const size_t nf = (size_t) T * (size_t) (g.hc * g.n_embd);
+                hash_rows.resize(nf);
+                cudaMemcpy(hash_rows.data(), ver.final_R_all(), nf * sizeof(float), cudaMemcpyDeviceToHost);
+                const int64_t rec[2] = {(int64_t) p, (int64_t) outv[0]};
+                std::fwrite(rec, sizeof rec, 1, final_r);
+                std::fwrite(hash_rows.data(), sizeof(float), nf, final_r);
+                std::fflush(final_r);
             }
             if (!follow.empty()) {   // the continuation stands in for the argmax
                 const size_t k0 = produced.size();

@@ -524,6 +524,7 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     SessionKvSource s;
     s.format = l.format; s.cells = l.cells; s.heads = g.n_head_kv; s.head_dim = g.head_dim;
     s.page_size = l.page_size; s.pooled_rows = l.pooled_rows; s.idx_dim = g.idx_key_dim;
+    s.idx_block = strata::kernels::qsa_real_shapes().idx_block;
     s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const auto src = pools(st);
     const auto sizes = s.sizes;
