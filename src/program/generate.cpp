@@ -14981,6 +14981,11 @@ int main(int argc, char** argv) {
         // EOF after QUIT used to lock a destroyed mutex (undefined behaviour; an abort on macOS).
         struct StdinShared {
             std::atomic<bool> stop_req{false};
+            // L4: YIELD - the server asks a decoding request to give way at the next window boundary (a short
+            // request is waiting).  Unlike STOP it keeps every committed token: the check sits after the loop's
+            // commit and after the STOP check, so the session stays exactly at what it has produced, and the
+            // server resumes it later with "prompt + produced tokens" (DONE's produced_n says how many).
+            std::atomic<bool> yield_req{false};
             std::mutex mu;
             std::condition_variable cv;
             std::deque<std::string> lines;
@@ -14988,6 +14993,7 @@ int main(int argc, char** argv) {
         };
         const auto in_shared = std::make_shared<StdinShared>();
         std::atomic<bool>& stop_req = in_shared->stop_req;
+        std::atomic<bool>& yield_req = in_shared->yield_req;
         std::mutex& in_mu = in_shared->mu;
         std::condition_variable& in_cv = in_shared->cv;
         std::deque<std::string>& in_lines = in_shared->lines;
@@ -15026,6 +15032,8 @@ int main(int argc, char** argv) {
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { st->stop_req.store(true); continue; }
+                // L4: YIELD gives way at the next decode window boundary without losing the token (see StdinShared)
+                if (l == "YIELD") { st->yield_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(st->mu);
                 st->lines.push_back(l);
                 st->cv.notify_one();
@@ -17096,6 +17104,7 @@ int main(int argc, char** argv) {
                 }
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            yield_req.store(false);  // L4: likewise a YIELD that arrived between requests
             err.clear();
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
@@ -20518,7 +20527,10 @@ int main(int argc, char** argv) {
                     if (nf) finish = "nonfinite";
                     else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
-                    const bool last = nf || eos || produced_n >= cap_now() || stop_req.load();
+                    // L4: YIELD - the same give-way as the synchronous loop below, on the pipelined path.
+                    // The window tokens above are committed (:20507 pl_commit_async), so nothing produced is lost.
+                    else if (yield_req.load()) finish = "yield";
+                    const bool last = nf || eos || produced_n >= cap_now() || stop_req.load() || yield_req.load();
                     const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
@@ -21245,6 +21257,11 @@ int main(int argc, char** argv) {
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
+                // L4: YIELD - give way to a waiting request at a window boundary, keeping every committed token.
+                // This sits AFTER the commit above (:21095 ver.commit(a+1)) and after the STOP check, so a STOP
+                // still wins and no produced token is lost: DONE's produced_n is exactly what the session holds,
+                // which the server re-sends as "prompt + produced tokens" (a resume, not a re-prefill).
+                if (yield_req.load()) { finish = "yield"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
             }
