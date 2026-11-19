@@ -76,6 +76,10 @@ struct ConvDiskStats {
     // STRATA_CONV_DISK_SKIP_RETRY_S, `reclaimed` how many such files were deleted after STRATA_CONV_DISK_RECLAIM_AFTER_S
     // of never being hit.
     uint64_t skipped_long = 0, skip_retries = 0, reclaimed = 0;
+    // L8: a slot whose base covers no more tokens than the caller already holds (`have` in recall()) is not read at
+    // all: the caller takes an image only when it beats std::max(resume, slot_tokens), so that read could never be
+    // used.  The cheap test is the file's own index (`tokens=`), read before the multi-GiB base.
+    uint64_t skipped_short = 0;
 };
 
 // Where one conversation's increment stands: the base file it extends and the newest point on its chain.
@@ -167,8 +171,20 @@ public:
     // Try the disk for this conversation.  On a hit the image is put into the RAM cache (`cache_`), so the caller's
     // next best() finds it; a miss is silent.  Never throws, never fatal.
     template <class Token>
-    bool recall(const std::vector<Token>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) {
+    bool recall(const std::vector<Token>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec,
+                int64_t have = -1) {
         if (!ready() || ids.empty()) return false;
+        // L8: `have` is the longest prefix the caller already holds.  A file covering no more tokens than that can
+        // never be taken by the caller (it takes only what beats std::max(resume, slot_tokens)), so its read is
+        // skipped outright; and a slot whose match does not beat `have` is not reported as a hit.  -1 keeps the
+        // pre-L8 behaviour (any slot sharing the conversation's root counts).  STRATA_CONV_DISK_MIN_PREFIX=0 turns
+        // the gate off.
+        static const bool prefix_gate = [] {
+            const char* e = std::getenv("STRATA_CONV_DISK_MIN_PREFIX");
+            return e == nullptr || (std::string(e) != "0" && std::string(e) != "off");
+        }();
+        const int64_t gate = prefix_gate ? have : -1;
+        const int64_t need = gate >= 0 ? gate : 0;
         SessionFileIdentity id;
         std::string err;
         if (!identity_(id, err)) return false;
@@ -189,10 +205,10 @@ public:
                     }
             }
             if (warm.live.ids.empty()) continue;
-            bool warm_ok = conversation_prefix(warm.live, ids, imgs) > 0;
+            bool warm_ok = conversation_prefix(warm.live, ids, imgs) > need;
             if (!warm_ok)
                 for (const auto& c : warm.checkpoints)
-                    if (conversation_prefix(c, ids, imgs) > 0) {
+                    if (conversation_prefix(c, ids, imgs) > need) {
                         warm_ok = true;
                         break;
                     }
@@ -206,6 +222,13 @@ public:
             Idx idx;
             if (!read_idx(path, idx)) continue;
             if (idx.model != id.model || idx.config != id.config || idx.cvec != (cvec ? 1 : 0)) continue;
+            // L8: the cheap gate.  A base covering no more tokens than the caller already holds cannot be taken (the
+            // caller restores only what beats std::max(resume, slot_tokens)), so its multi-GiB read is not paid for at
+            // all.  The index carries that length (`tokens=`), so no conversation file is opened to learn it.
+            if (gate >= 0 && idx.tokens <= gate) {
+                ++stats_.skipped_short;
+                continue;
+            }
             // The skip screen: once a slot has been read whole and judged "not this prompt's prefix" skip_min_miss times
             // in a row, its multi-GiB read is skipped instead of paid for nothing.  A length test is deliberately NOT a
             // condition here: a file SHORTER than the prompt is exactly the case that keeps getting read back for
@@ -252,10 +275,10 @@ public:
             // differently, so the live state's tail often differs while a checkpoint at 16 K/32 K/48 K tokens still
             // matches exactly - the matcher (ConversationCache::best/borrows) then restores that prefix and only the
             // rest is read.  Anything else is not this conversation: drop the index and go on.
-            bool usable = conversation_prefix(image.live, ids, imgs) > 0;
+            bool usable = conversation_prefix(image.live, ids, imgs) > need;
             if (!usable)
                 for (const auto& c : image.checkpoints)
-                    if (conversation_prefix(c, ids, imgs) > 0) {
+                    if (conversation_prefix(c, ids, imgs) > need) {
                         usable = true;
                         break;
                     }
@@ -329,7 +352,8 @@ public:
         char b[640];
         std::snprintf(b, sizeof b,
                       "disk: %llu files %.1f GiB / %.1f GiB cap, hits %llu miss %llu writes %llu (last %.0f ms) "
-                      "errors %llu dropped %llu quota-deleted %llu, skipped %llu retries %llu reclaimed %llu, "
+                      "errors %llu dropped %llu quota-deleted %llu, skipped %llu retries %llu reclaimed %llu "
+                      "short %llu, "
                       "delta %llu segments %.2f GiB (+%.0f ms last, "
                       "read %llu) compactions %llu errors %llu, idle-flush %llu %.2f GiB (last %.2f GiB %.0f ms)",
                       (unsigned long long) stats_.files, (double) stats_.bytes / 1073741824.0,
@@ -338,6 +362,7 @@ public:
                       (unsigned long long) stats_.write_errors, (unsigned long long) stats_.dropped,
                       (unsigned long long) stats_.quota_deletes, (unsigned long long) stats_.skipped_long,
                       (unsigned long long) stats_.skip_retries, (unsigned long long) stats_.reclaimed,
+                      (unsigned long long) stats_.skipped_short,
                       (unsigned long long) stats_.delta_writes,
                       (double) stats_.delta_bytes / 1073741824.0, stats_.last_delta_ms,
                       (unsigned long long) stats_.delta_reads, (unsigned long long) stats_.compactions,

@@ -17924,9 +17924,12 @@ int main(int argc, char** argv) {
                         conv_disk.close();
                     }
                 }
+                // L8: the longest prefix this request already holds.  Handed to the disk tier so it does not read a
+                // file that cannot beat it (the take below needs `parked.tokens > std::max(resume, slot_tokens)`).
+                const int64_t have_prefix = std::max(resume, slot_tokens);
                 if (conv_disk.ready() && !ids.empty() &&
-                    conversations.best(ids, req_imgs, want_cvec).tokens <= std::max(resume, slot_tokens))
-                    conv_disk.recall(ids, req_imgs, want_cvec);
+                    conversations.best(ids, req_imgs, want_cvec).tokens <= have_prefix)
+                    conv_disk.recall(ids, req_imgs, want_cvec, have_prefix);
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
@@ -18332,6 +18335,12 @@ int main(int argc, char** argv) {
                 if (!lent) lent_slot = -1;
                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
                 static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+                // L8 (test only, opt-in): force the restore path to fail, so the degraded branch below can be
+                // exercised once on demand.  Never set outside that check: the default path is untouched.
+                static const bool ckpt_fail_test = [] {
+                    const char* v = std::getenv("STRATA_CKPT_FAIL_TEST");
+                    return v != nullptr && v[0] == '1' && v[1] == '\0';
+                }();
                 if (reread && c != nullptr) {
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
                     // one run (below, with the prompt path's slots lent like any read) - the same chunks the request
@@ -18348,7 +18357,24 @@ int main(int argc, char** argv) {
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+                } else if (c == nullptr) {
+                    // L8: nothing to mount at `resume` (a borrowed prefix whose donor lost that checkpoint, a pool
+                    // that reused them, a restored conversation whose checkpoints did not line up).  This used to end
+                    // the process: it did so twice on 2026-11-19 (server.log 54938/54957, exit code 1).  Read the
+                    // prompt again instead - the state this leaves is the one the `resume == 0` branch above leaves.
+                    std::fprintf(stderr, "strata serve: no checkpoint at %lld to mount: reading the prompt again\n",
+                                 (long long) resume);
+                    resume = 0;
+                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    cudaStreamSynchronize(main_stream);
+                    for (auto& st : stages) {
+                        const strata::core::OnDevice on(st->dev);
+                        strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+                        cudaStreamSynchronize(st->stream);
+                    }
+                    checks.clear();
+                } else if (ckpt_fail_test || !checkpoint_restore(*c, ss, g) ||
+                           c->stage_parts.size() != stages.size() ||
                            [&] {
                                for (size_t i = 0; i < stages.size(); ++i) {
                                    const strata::core::OnDevice on(stages[i]->dev);
@@ -18356,8 +18382,20 @@ int main(int argc, char** argv) {
                                }
                                return false;
                            }()) {
-                    std::printf("ERR restoring a conversation checkpoint failed\n");
-                    return 1;
+                    // L8: a restore that fails is the same shape as a missing checkpoint - and the session may be
+                    // half written already, so it is zeroed before the prompt is read again, never returned 1.
+                    // `restore failed` vs `no checkpoint` keeps the two causes apart in the log.
+                    std::fprintf(stderr, "strata serve: checkpoint restore failed at %lld: reading the prompt again\n",
+                                 (long long) resume);
+                    resume = 0;
+                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    cudaStreamSynchronize(main_stream);
+                    for (auto& st : stages) {
+                        const strata::core::OnDevice on(st->dev);
+                        strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+                        cudaStreamSynchronize(st->stream);
+                    }
+                    checks.clear();
                 }
                 if (lent && lent_slot == admit_slot) {
                     // the slot this request continues in drops its checkpoints at the admission: this one moves back
