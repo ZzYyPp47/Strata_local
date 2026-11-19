@@ -256,9 +256,38 @@ bool park_trace_on() {
     return on;
 }
 
+bool host_copy_enabled() {
+    // L2: DEFAULT OFF. This path was measured to bring no speed-up, and with it on a 198 k-token request made the
+    // engine die with 0xC0000005 (ACCESS_VIOLATION) between `l2_b_disk` and `l2_c_kvg`; STRATA_L2_HOSTCOPY=0 made the
+    // same request return HTTP 200 in 41.4 s. So the original transfer is the default again and this is opt-in only,
+    // for whoever debugs why a host-side memcpy of those buffers faults.
+    static const bool on = [] { const char* v = std::getenv("STRATA_L2_HOSTCOPY"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// L2 (2026-11-19): with --kv streaming (kv_mode 1) the authoritative K/V pools live in host memory, so a park and a
+// restore are host-to-host copies.  copy_nonblocking below would still route them through cudaMemcpyAsync plus a
+// stream synchronise per call, and a pageable source the OS has paged out stalls it at drive speed.  A plain memcpy,
+// sliced with one progress beat per MiB, moves the same bytes at the host's bandwidth and keeps the watchdog fed.
+// STRATA_L2_HOSTCOPY=0 restores the old path.
+bool transfer_host(void* dst, const void* src, size_t n, std::string& error) {
+    if (!n) return true;
+    if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+    constexpr size_t kSlice = (size_t) 1 << 20;
+    auto* d = static_cast<uint8_t*>(dst);
+    const auto* s = static_cast<const uint8_t*>(src);
+    for (size_t o = 0; o < n; o += kSlice) {
+        std::memcpy(d + o, s + o, std::min(kSlice, n - o));
+        core::progress_beat();
+    }
+    return true;
+}
+
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+    // L2: neither side is device memory (the streaming pools are host) -> a plain memcpy, not a queued DMA plus a
+    // synchronise.  Device and device-mapped sources keep the CUDA path below.
+    if (host_copy_enabled() && !on_device(dst) && !on_device(src)) return transfer_host(dst, src, n, error);
     // Default handles both device allocations and device-mapped host pool aliases.
     const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
     if (e == cudaSuccess) return true;
@@ -357,6 +386,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         // (kv_mode 0: the pools are device memory by construction, so no pointer-attribute query)
         const bool staged = a.active && src[i] != nullptr && sizes[i] > keep && a.used + (sizes[i] - keep) <= a.cap &&
                             (st.kv_mode == 0 || on_device(src[i]));
+        const bool host_src = host_copy_enabled() && st.kv_mode == 1 && src[i] != nullptr;
         const auto t1 = tick();
         const long rf0 = trace ? conversation_trace::thread_minflt() : 0;
         if (staged) dst[i]->resize_for_overwrite(sizes[i]);
@@ -365,7 +395,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (trace) kv_save_trace().resize_faults += conversation_trace::thread_minflt() - rf0;
         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
-                if (!staged) return transfer(p, s, n, error);
+                if (!staged) return host_src ? transfer_host(p, s, n, error) : transfer(p, s, n, error);
                 const cudaError_t e = conversation_detail::copy_nonblocking(a.stage + a.used, s, n, true);
                 if (e != cudaSuccess) { error = std::string("conversation snapshot stage copy: ") + cudaGetErrorString(e); return false; }
                 a.items.push_back({p, n, a.used});
@@ -409,7 +439,24 @@ namespace {
 // After the authoritative pools were rewritten: the VRAM slots of a streamed state still hold the outgoing
 // conversation, so resolve must refill them before any attention reads (shared by restore and direct copy).
 bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 1) {
+        // L2: evicting every page is only right when the slots hold *another* conversation. When the same state
+        // that was last refreshed is merely extended (and never shortened, which would leave stale pages past the
+        // end), its resident pages are exactly the prefix attention is about to read, so keep them and let
+        // kv_stream_resolve refill only what is genuinely missing. STRATA_L2_KEEP_RESIDENT=0 restores the old
+        // unconditional eviction.
+        struct Keep { const QsaState* st; int64_t upto; };
+        static Keep keep{nullptr, -1};
+        const char* env = std::getenv("STRATA_L2_KEEP_RESIDENT");
+        const bool on = !(env != nullptr && env[0] == '0');
+        const bool same = on && keep.st == &st && keep.upto >= 0 && upto >= keep.upto;
+        if (!same) strata::kernels::kv_stream_reset(st.map, nullptr);
+        if (std::getenv("STRATA_L2_TRACE") != nullptr)
+            std::fprintf(stderr, "strata l2: refresh_residency upto=%lld evicted=%d same_state=%d\n",
+                         (long long)upto, same ? 0 : 1, keep.st == &st ? 1 : 0);
+        keep.st = &st;
+        keep.upto = upto;
+    }
     if (st.kv_mode == 2 && upto > 0) {
         auto shapes = strata::kernels::qsa_real_shapes();
         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;

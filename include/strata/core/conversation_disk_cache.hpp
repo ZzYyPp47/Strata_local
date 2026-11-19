@@ -68,6 +68,14 @@ struct ConvDiskStats {
     uint64_t flushes = 0, flush_bytes = 0;
     uint64_t last_flush_bytes = 0;
     double last_flush_ms = 0;
+    // The skip screen (STRATA_CONV_DISK_SKIP): a slot that has been read whole and judged "not this prompt's prefix"
+    // `skip_min_miss` times in a row (conversation_prefix() found neither its live state nor any checkpoint a strict
+    // prefix of the prompt) has its whole-file read skipped instead of paid for nothing.  The name `skipped_long` is
+    // historical: the screen no longer tests the file's length, since a file shorter than the prompt is the case that
+    // keeps getting read back for nothing.  `skip_retries` is how often such a slot was read again after
+    // STRATA_CONV_DISK_SKIP_RETRY_S, `reclaimed` how many such files were deleted after STRATA_CONV_DISK_RECLAIM_AFTER_S
+    // of never being hit.
+    uint64_t skipped_long = 0, skip_retries = 0, reclaimed = 0;
 };
 
 // Where one conversation's increment stands: the base file it extends and the newest point on its chain.
@@ -88,6 +96,14 @@ public:
     ConversationDiskCache(std::string dir, uint64_t cap_bytes, int64_t min_tokens, uint64_t min_free_bytes)
         : dir_(std::move(dir)), cap_bytes_(cap_bytes), min_tokens_(min_tokens), min_free_bytes_(min_free_bytes) {
         if (dir_.empty()) return;
+        // The screen's knobs, read once at start-up: STRATA_CONV_DISK_SKIP=0 turns all of it off.
+        if (const char* e = std::getenv("STRATA_CONV_DISK_SKIP"); e != nullptr && std::string(e) == "0") skip_enabled_ = false;
+        if (const char* e = std::getenv("STRATA_CONV_DISK_SKIP_MIN_MISS"); e != nullptr)
+            skip_min_miss_ = std::max<int64_t>(1, std::atoll(e));
+        if (const char* e = std::getenv("STRATA_CONV_DISK_SKIP_RETRY_S"); e != nullptr)
+            skip_retry_ms_ = std::max<int64_t>(0, std::atoll(e)) * 1000;
+        if (const char* e = std::getenv("STRATA_CONV_DISK_RECLAIM_AFTER_S"); e != nullptr)
+            reclaim_after_s_ = std::max<int64_t>(0, std::atoll(e));
         enabled_ = true;
         sweep();
         writer_ = std::thread([this] { write_loop(); });
@@ -190,6 +206,29 @@ public:
             Idx idx;
             if (!read_idx(path, idx)) continue;
             if (idx.model != id.model || idx.config != id.config || idx.cvec != (cvec ? 1 : 0)) continue;
+            // The skip screen: once a slot has been read whole and judged "not this prompt's prefix" skip_min_miss times
+            // in a row, its multi-GiB read is skipped instead of paid for nothing.  A length test is deliberately NOT a
+            // condition here: a file SHORTER than the prompt is exactly the case that keeps getting read back for
+            // nothing (a file already no shorter than the prompt can never be its prefix either, so both sides need the
+            // same screen).  The retry window keeps a slot from being skipped for good, and a hit forgets it entirely.
+            if (skip_enabled_) {
+                bool skip = false;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    SkipNote& note = skips_[path];
+                    const int64_t ms = now_ms();
+                    if (note.skipping && ms - note.at_ms >= skip_retry_ms_) {
+                        note.skipping = false;
+                        ++stats_.skip_retries;
+                    } else if (note.skipping || note.miss >= (uint32_t) skip_min_miss_) {
+                        note.skipping = true;
+                        note.at_ms = ms;
+                        ++stats_.skipped_long;
+                        skip = true;
+                    }
+                }
+                if (skip) continue;
+            }
             SavedConversation image;
             size_t bytes = 0;
             SessionStatus st;
@@ -202,6 +241,7 @@ public:
                              std::filesystem::path(path).filename().string().c_str(), error.c_str(),
                              session_error_name(st.error));
                 note_read(false, t0, path);
+                note_slot_miss(path);
                 continue;
             }
             // The increment beside it (--conversation-cache-disk-delta) is applied on top of the base: the image is
@@ -220,7 +260,17 @@ public:
                         break;
                     }
             if (!usable) {
+                if (std::getenv("STRATA_L2_TRACE") != nullptr) {
+                    const size_t lv = image.live.ids.size(), pr = ids.size();
+                    size_t common = 0;
+                    while (common < lv && common < pr && image.live.ids[common] == ids[common]) ++common;
+                    std::fprintf(stderr, "strata l2: recall miss %s: live %zu prompt %zu common %zu ckpts %zu\n",
+                                 std::filesystem::path(path).filename().string().c_str(), lv, pr, common,
+                                 image.checkpoints.size());
+                }
                 note_read(false, t0, path);
+                note_slot_miss(path);
+                reclaim_if_idle(path, idx);
                 continue;   // another conversation that shares our first tokens
             }
             if (image.stage_images.size() > 1) continue;   // a layer split writes one image per stage: only stage 0
@@ -232,6 +282,7 @@ public:
                 return false;
             }
             note_read(true, t0, path);
+            note_slot_hit(path);
             return true;
         }
         note_read(false, t0, std::string());
@@ -275,16 +326,19 @@ public:
     // The engine log's one line about the disk tier.
     std::string summary() const {
         std::lock_guard<std::mutex> lk(mu_);
-        char b[512];
+        char b[640];
         std::snprintf(b, sizeof b,
                       "disk: %llu files %.1f GiB / %.1f GiB cap, hits %llu miss %llu writes %llu (last %.0f ms) "
-                      "errors %llu dropped %llu quota-deleted %llu, delta %llu segments %.2f GiB (+%.0f ms last, "
+                      "errors %llu dropped %llu quota-deleted %llu, skipped %llu retries %llu reclaimed %llu, "
+                      "delta %llu segments %.2f GiB (+%.0f ms last, "
                       "read %llu) compactions %llu errors %llu, idle-flush %llu %.2f GiB (last %.2f GiB %.0f ms)",
                       (unsigned long long) stats_.files, (double) stats_.bytes / 1073741824.0,
                       cap_bytes_ == 0 ? 0.0 : (double) cap_bytes_ / 1073741824.0, (unsigned long long) stats_.hits,
                       (unsigned long long) stats_.misses, (unsigned long long) stats_.writes, stats_.last_write_ms,
                       (unsigned long long) stats_.write_errors, (unsigned long long) stats_.dropped,
-                      (unsigned long long) stats_.quota_deletes, (unsigned long long) stats_.delta_writes,
+                      (unsigned long long) stats_.quota_deletes, (unsigned long long) stats_.skipped_long,
+                      (unsigned long long) stats_.skip_retries, (unsigned long long) stats_.reclaimed,
+                      (unsigned long long) stats_.delta_writes,
                       (double) stats_.delta_bytes / 1073741824.0, stats_.last_delta_ms,
                       (unsigned long long) stats_.delta_reads, (unsigned long long) stats_.compactions,
                       (unsigned long long) stats_.delta_errors, (unsigned long long) stats_.flushes,
@@ -366,10 +420,61 @@ private:
                    std::chrono::steady_clock::now().time_since_epoch())
             .count();
     }
+    static int64_t now_s() {
+        return (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    }
+    // The skip screen's bookkeeping: a miss resets the retry clock and clears a skip; a hit forgets the slot (its
+    // file was just replaced or is useful again).
+    void note_slot_miss(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mu_);
+        SkipNote& note = skips_[path];
+        ++note.miss;
+        note.at_ms = now_ms();
+        note.skipping = false;
+    }
+    void note_slot_hit(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mu_);
+        skips_.erase(path);
+    }
+    // A slot nobody has hit for STRATA_CONV_DISK_RECLAIM_AFTER_S and that keeps missing is a file whose conversation
+    // has not come back: it holds one of the four slots this key has, and write_one refuses to replace a base older
+    // than its increment, so without this it would be re-read for nothing forever.  idx.at is only ever refreshed by a
+    // hit (touch_idx), which is what makes "old" mean "unused".
+    void reclaim_if_idle(const std::string& path, const Idx& idx) {
+        if (!skip_enabled_ || reclaim_after_s_ <= 0 || idx.at <= 0) return;
+        if (now_s() - idx.at < reclaim_after_s_) return;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = skips_.find(path);
+            if (it == skips_.end() || it->second.miss < (uint32_t) skip_min_miss_) return;
+        }
+        std::error_code e1, e2;
+        std::filesystem::remove(path, e1);
+        std::filesystem::remove(idx_path_of(path), e2);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            skips_.erase(path);
+            ++stats_.reclaimed;
+        }
+        std::fprintf(stderr, "strata serve: conversation disk: stale file reclaimed (%s, %lld tokens, idle %lld s)\n",
+                     std::filesystem::path(path).filename().string().c_str(), (long long) idx.tokens,
+                     (long long) (now_s() - idx.at));
+    }
 
     std::string dir_;
     uint64_t cap_bytes_ = 0, min_free_bytes_ = 0;
     int64_t min_tokens_ = 0;
+    // The skip screen and the reclaim of files nobody has hit for long (see ConvDiskStats' comment).
+    struct SkipNote {
+        int64_t at_ms = 0;      // when the slot was last looked at (steady clock)
+        uint32_t miss = 0;      // misses in a row in this process
+        bool skipping = false;  // its whole-file read is being skipped right now
+    };
+    std::unordered_map<std::string, SkipNote> skips_;
+    bool skip_enabled_ = true;
+    int64_t skip_min_miss_ = 3, skip_retry_ms_ = 600000, reclaim_after_s_ = 259200;
     bool enabled_ = false;
     mutable std::mutex mu_;
     std::condition_variable cv_, cv_done_;
@@ -785,6 +890,8 @@ inline bool ConversationDiskCache::write_one(const SavedConversation& image, uin
         std::lock_guard<std::mutex> lk(mu_);
         ++stats_.writes;
         stats_.last_write_ms = ms;
+        // a fresh file must not inherit the misses of the one it replaced
+        skips_.erase(path);
     }
     std::fprintf(stderr, "strata serve: conversation disk: wrote %lld tokens, %.2f GiB in %.0f ms (%s)\n",
                  (long long) idx.tokens, (double) bytes / 1073741824.0, ms,

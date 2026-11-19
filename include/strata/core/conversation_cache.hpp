@@ -242,19 +242,32 @@ bool conversation_covers(const ConversationCheckpoint& c, const std::vector<Toke
     return j == images.size();
 }
 
+// L2: the shortest shared prefix worth restoring (see conversation_prefix). Below this a restore costs more than the
+// prefill it would save, so the match is refused and the prompt is read.
+inline constexpr size_t kConvMinPrefix = 512;
+
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
                             const std::vector<ConversationImageKey>& images) {
     const size_t n = c.ids.size();
-    // The last prompt token always starts the next verify window.
-    if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
+    if (n == 0 || prompt.empty()) return 0;
+    // L2: the longest common prefix, capped one token short of the prompt so this request still opens a window.
+    // The old rule demanded the state be a *strict, complete* prefix (n < prompt.size() AND every state token equal
+    // to the prompt's). A real turn is never that shape: the prompt's tail is the new turn's text, the state's tail
+    // is the previous turn's reply, so only the shared prefix matches - measured on this box: live 214858,
+    // prompt 213477, common 213464. Refusing it made every long-context request re-read ~12 GiB from disk before
+    // prefill (9.29 s). A short match is not worth a restore, so anything under kConvMinPrefix is still refused.
+    const size_t cap = prompt.size() - 1;   // the last prompt token always starts the next verify window
+    size_t m = 0;
+    while (m < n && m < cap && c.ids[m] == prompt[m]) ++m;
+    if (m < kConvMinPrefix) return 0;
     size_t j = 0;
     for (const auto& image : images) {
-        if (image.start >= (int64_t) n) continue;
+        if (image.start >= (int64_t) m) continue;
         if (j == c.imgs.size() || !(c.imgs[j++] == image)) return 0;
     }
     if (j != c.imgs.size()) return 0;
-    return (int64_t) n;
+    return (int64_t) m;
 }
 
 class ConversationCache {

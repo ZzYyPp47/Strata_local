@@ -4985,6 +4985,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     const bool staged = st.kv_mode == 1;
+                    // L2 experiment (STRATA_L2_SKIP_STAGE=1): the paid-for 3.3 GB of host->device staging per
+                    // prefill is skipped to test whether the resident slots already hold these cells. Output stays
+                    // byte-identical only if they do; the 5-prompt greedy regression is the judge.
+                    static const bool skip_stage = [] {
+                        const char* e = std::getenv("STRATA_L2_SKIP_STAGE");
+                        return e != nullptr && e[0] == '1';
+                    }();
                     if (staged) {
                         pt.mark(kPfKvStage, cs);
                         if (kv_pending == qsa_index) {
@@ -4993,7 +5000,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return false;
                             }
                             kv_pending = -1;
-                        } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                        } else if (!skip_stage) strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
                                                             core::qsa_kv_format(st),
                                                             (p0 + s.page_size - 1) / s.page_size, s, m.cs);
                         pt.mark(kPfQsa, cs);

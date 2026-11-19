@@ -2678,6 +2678,18 @@ class StrataEngine:
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
+        # L3-solo queued admission: with no batch slots the solo path used to skip
+        # _take_control entirely, so STRATA_ADMIT_SHORT_FIRST / STRATA_ADMIT_MAX_WAIT_S
+        # never applied and the engine ran strictly in stdin arrival order.
+        ok = yield from self._take_control(cancel, len(ids), new=True)
+        if not ok:
+            return
+        try:
+            yield from self._solo_path(ids, max_new, sampling, cancel, embeddings, prefill_only)
+        finally:
+            self.ctl.release()
+
+    def _solo_path(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         lines_q, stop_line = self.lines, "STOP\n"
@@ -5099,7 +5111,26 @@ class Service:
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
-        if getattr(self.engine, "batch", 0):
+        # L2-5a (2026-11-18): opt in to slot save/restore on a --batch engine.  The control lines are taken the
+        # same way vram() takes them (fifo first, then engine.ctl, then _ctl_held = True), so a session file cannot
+        # interleave with a request being admitted.  Off by default: without the env the path below is unchanged.
+        _scope_env = os.environ.get("STRATA_SLOT_SCOPE")
+        if _scope_env is None:                          # the launcher passes config "env" to the engine only, not to us
+            _cfg_path = getattr(self, "config_path", None)
+            if not _cfg_path:
+                try:
+                    _cfg_path = sys.argv[sys.argv.index("--config") + 1]
+                except Exception:
+                    _cfg_path = None
+            if _cfg_path:
+                try:
+                    with open(_cfg_path, "r", encoding="utf-8") as _cf:
+                        _scope_env = (json.load(_cf).get("env") or {}).get("STRATA_SLOT_SCOPE")
+                except Exception:
+                    _scope_env = None
+        batch_scope = bool(getattr(self.engine, "batch", 0)) and \
+            str(_scope_env).strip().lower() not in ("", "none", "0", "false", "no", "off")
+        if getattr(self.engine, "batch", 0) and not batch_scope:
             # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
             # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
             return error(501, "slot save/restore is not available with parallel requests (\"parallel\" / --batch)")
@@ -5127,6 +5158,13 @@ class Service:
                 waiting = False
                 if not self.loaded():
                     return error(503, "the model is not loaded")
+                ctl = None
+                if batch_scope:
+                    ctl = getattr(self.engine, "ctl", None)
+                    if ctl is not None and not ctl.acquire(timeout=getattr(self, "CONTROL_WAIT_S", 300.0)):
+                        return error(503, "a request is still holding the control lines; try again when it has finished")
+                    if ctl is not None:
+                        self.engine._ctl_held = True
                 with self.status_lock:
                     self.status.update(busy=True, phase="saving the session" if action == "save"
                                        else "restoring a session", started=time.time(), first_token=None,
@@ -5146,6 +5184,9 @@ class Service:
                 except ValueError as e:                     # the request itself (an invalid command)
                     return error(400, str(e))
                 finally:
+                    if ctl is not None:
+                        self.engine._ctl_held = False
+                        ctl.release()
                     with self.status_lock:
                         self.status["busy"] = False
                     self.last_request_at = time.time()

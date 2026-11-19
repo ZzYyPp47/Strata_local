@@ -7553,6 +7553,10 @@ int main(int argc, char** argv) {
     auto batch_max_t = [&]() -> int {
         // (--batch-mtp and STRATA_PIPED_MTP draft with the draft layer's kernels, built for the narrow window: their windows
         // stay at most kVerifyNarrowT rows; only the plain batch windows are wide)
+        // L2 (measured, reverted): a 16-row build (STRATA_WINDOW_MAX_T=16) with --spec 8 gave decode 160.7 vs 164.2 and
+        // dropped draft acceptance from 75.7% to 59.7% - the MTP drafter's proposals decay fast with depth and
+        // --spec-min-p 0.55 already cuts most of them, so a wider window only verifies more low-quality drafts.  The
+        // 8-row window is the fastest this drafter supports, so keep the narrow first branch.
         if (batch_mtp && !piped_mtp) return (int) strata::kernels::kVerifyNarrowT;
         const int plain = std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT));
         const int group_rows = (piped_mtp && o.batch_groups > 1 && o.batch > 0)
@@ -7928,7 +7932,7 @@ int main(int argc, char** argv) {
                                  vram_free_note().c_str());
                     return 1;
                 }
-                d->set_max_drafts(piped_mtp ? pm_drafts : 1);   // the serial windows verify one proposal per slot
+                d->set_max_drafts(1);   // L2: the admission window stays narrow (piped_mtp widens it once the slot is decoding, below); the verify window's CAPACITY is still sized by pm_drafts at startup
                 d->set_ple_session(bslot_ss[0][(size_t) b].get());
                 slot_mtp.push_back(std::move(d));
             }
@@ -15057,8 +15061,12 @@ int main(int argc, char** argv) {
         }
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
+        // L2: the same per-step marks under STRATA_L2_TRACE, so the prompt_ms split can be read without the
+        // rest of STRATA_TRACE's volume. Every request opens with tr("r0"), so subtracting that value gives the
+        // per-request timeline even though `t0` is process-wide.
+        const bool trace_l2 = std::getenv("STRATA_L2_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
-            if (!trace) return;
+            if (!trace && !trace_l2) return;
             static Clock::time_point t0;   // process-wide: the stages run on different threads
             static bool t0_set = false;
             if (!t0_set) { t0 = Clock::now(); t0_set = true; }
@@ -17681,6 +17689,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            tr("l2_a_commit");
             // STRATA_MTP_ROOM_MIN: this request points the prompt path's ring at the drafter's experts, if it reads
             // enough new tokens and the room applies here.  The open is below, once `read_from` is known: the
             // threshold counts the tokens the request reads, not the whole prompt (a reused conversation prefix buys
@@ -17882,6 +17891,7 @@ int main(int argc, char** argv) {
             // ---- conversation disk (--conversation-cache-disk): VRAM -> RAM cache -> disk ----
             // The RAM cache answers first.  A miss, and the disk is asked for this token prefix: a hit lands in the RAM
             // cache, so the lines below take the same path a hot conversation takes (restore, never a cold prefill).
+            tr("l2_b_disk");
             if (conv_disk.enabled()) {
                 if (!conv_disk.ready()) {
                     strata::core::SessionFileIdentity disk_id;
@@ -18169,6 +18179,7 @@ int main(int argc, char** argv) {
             }
             // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
             // (STRATA_PARK_VRAM_MIB: the parked K/V copies in VRAM go first, then one more try)
+            tr("l2_c_kvg");
             if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce) &&
                 (strata::core::conversation_park_vram_release_all() == 0 ||
                  !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce))) {
@@ -18292,6 +18303,7 @@ int main(int argc, char** argv) {
                 }
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
+            tr("l2_d_restore");
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
@@ -18377,6 +18389,7 @@ int main(int argc, char** argv) {
                     }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
+            tr("l2_e_before_request");
             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
             req_times = ReqTimes{};
@@ -18929,10 +18942,12 @@ int main(int argc, char** argv) {
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             int64_t req_chunk = 0, req_chunk_len = 0;   // the DONE line's chunk=: the longest batched segment's first chunk
 
+            int bs_busy = 0;   // L2 S3: slots decoding right now - the read is split only when someone is actually waiting
             // STRATA_PREFILL_CPU_SHARE_BATCH: the read takes the CPU share only with no slot decoding (their windows use the pool)
             auto share_gate = [&]() {
                 int busy = 0;
                 for (const auto& x : bs) busy += x.active ? 1 : 0;
+                bs_busy = busy;   // L2 S3: no waiters -> the next read runs whole instead of yielding every yield_chunks
                 strata::prefill::Prefill::set_share_blocked(busy > 0);
                 static int said = 0;
                 static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH"); return v != nullptr && v[0] == '1'; }();
@@ -19473,6 +19488,10 @@ int main(int argc, char** argv) {
                 }();
                 const bool pr_on = piped && pr_piece > 0;
                 auto piece_now = [&]() -> int64_t {
+                    // L2 S3 (measured, reverted): passing 0 here when no slot was decoding reads "one run" as "do not
+                    // split at all", and one 213k-token run was 17x slower than 8-chunk pieces (prefill 168 -> 2874 ms,
+                    // single total 49.7 -> 74.4 s).  bs_busy is kept for the CPU-share decision only.
+                    (void) bs_busy;
                     return pr_on ? strata::program::piped_read_piece(pr_piece, C)
                                  : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C,
                                                                      yield_chunks);
@@ -21670,6 +21689,11 @@ int main(int argc, char** argv) {
                         }
                         sl.n_drafts = std::max(1, nd);
                         sl.draft_ready = true;
+                        // L2 (STRATA_PIPED_MTP): the admission above read the prompt with a narrow window (nd = 1).
+                        // From here the slot is decoding, so widen its drafter to pm_drafts proposals. Measured:
+                        // widening at startup instead costs 17x on prefill (168 -> 2817 ms) for only +9.6% decode.
+                        if (piped_mtp && pm_drafts > 1 && slot_mtp[(size_t) admit_slot])
+                            slot_mtp[(size_t) admit_slot]->set_max_drafts(pm_drafts);
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
@@ -21751,6 +21775,12 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (std::getenv("STRATA_L2_TRACE") != nullptr)   // L2: the prompt_ms split, without STRATA_TRACE's volume
+                std::fprintf(stderr, "strata l2: prompt %.0f ms = read %.1f + windows %.1f + ckpt %d (sync %.1f + save %.1f "
+                                     "+ evict %.1f) + rest %.1f\n", prompt_ms, req_times.read_ms, req_times.windows_ms,
+                             req_times.ckpts, req_times.sync_ms, req_times.save_ms, req_times.evict_ms,
+                             prompt_ms - req_times.read_ms - req_times.windows_ms - req_times.sync_ms -
+                             req_times.save_ms - req_times.evict_ms);
             if (ck_from_pool + ck_fresh > 0)
                 std::fprintf(stderr, "strata serve: checkpoint pool: this request took %zu checkpoint%s ready from the pool and allocated %zu fresh\n",
                              ck_from_pool, ck_from_pool == 1 ? "" : "s", ck_fresh);
